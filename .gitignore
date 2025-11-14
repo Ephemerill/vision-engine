@@ -1,1 +1,4 @@
 /venv
+/gfpgan
+yolo11m.pt
+yolo11x.pt

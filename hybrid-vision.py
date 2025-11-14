@@ -168,7 +168,7 @@ def action_comprehension_thread():
             
             success, buffer = cv2.imencode('.jpg', current_frame)
             if not success: continue
-            b64_frame = base64.b64encode(buffer).decode('utf-8')
+            b64_frame = base66.b64encode(buffer).decode('utf-8')
             
             prompt = "";
             if current_model == MODEL_MOONDREAM:
@@ -219,9 +219,6 @@ def load_known_faces(known_faces_dir):
     global known_face_encodings, known_face_names, SOTA_MODEL, SOTA_METRIC, MAX_RECOGNITION_DISTANCE, DEFAULT_RECOGNITION_THRESHOLD
     global DeepFace, dst # Need access to the imported modules
     
-    # This print will be captured by the loading bar
-    # print(f"   - Loading from {known_faces_dir} using {SOTA_MODEL}...") 
-    
     if SOTA_MODEL != "Dlib":
         if not os.path.exists(known_faces_dir): return
 
@@ -247,16 +244,12 @@ def load_known_faces(known_faces_dir):
                             known_face_names.append(person_name)
                             image_count += 1
                         else:
-                            pass # print(f"   - WARNING: No face found in {image_path}")
+                            pass 
 
                     except Exception as e:
-                        pass # print(f"   - ERROR loading {image_path} with {SOTA_MODEL}: {e}")
+                        pass 
             
-            # if image_count > 0:
-                # print(f"   - Loaded {image_count} SOTA encodings for {person_name}.")
-
         if not known_face_encodings:
-            # print(f"   - WARNING: SOTA model failed. Retrying with Dlib...")
             SOTA_MODEL = "Dlib"
             SOTA_METRIC = "euclidean"
             MAX_RECOGNITION_DISTANCE = 0.6
@@ -285,9 +278,7 @@ def load_known_faces(known_faces_dir):
                             known_face_names.append(person_name)
                         image_count += 1
                     except Exception as e:
-                        pass # print(f"   - ERROR loading {image_path} with Dlib: {e}")
-            # if image_count > 0:
-                # print(f"   - Loaded {image_count} Dlib images for {person_name}.")
+                        pass 
 
 def get_containing_body_box(face_box, body_boxes):
     ft, fr, fb, fl = face_box
@@ -626,23 +617,28 @@ def video_processing_thread():
             output_frame = frame.copy()
             server_data["live_faces"] = live_face_payload
 
-        # --- TUI CV2 Window ---
+        # --- TUI CV2 Window (MODIFIED BLOCK) ---
         if SHOW_CV2_WINDOW:
             try:
                 cv2.imshow("Headless Feed (Test)", frame)
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    SHOW_CV2_WINDOW = False
-                    cv2.destroyWindow("Headless Feed (Test)")
+                # We MUST call waitKey for imshow to update.
+                # We do NOT check for key presses, as that fights the TUI.
+                # The user must close the window with the OS controls.
+                cv2.waitKey(1)
             except cv2.error:
-                # Window was closed manually
-                SHOW_CV2_WINDOW = False
+                # This error (e.g., "Cannot open display") will be 
+                # thrown if the OS or threading model prevents it.
+                # We PASS so the thread doesn't crash and the flag 
+                # isn't set to False (which causes the flicker).
+                pass 
         else:
-            cv2.destroyWindow("Headless Feed (Test)") 
+            # This is key: if the flag is false, we must destroy the window.
+            # destroyAllWindows is idempotent and safe to call.
+            cv2.destroyAllWindows()
             
     # --- End of thread loop ---
     cap.release()
     cv2.destroyAllWindows()
-    # print("Video processing thread stopped.") # Silenced for TUI
 
 # --- TUI HELPER FUNCTIONS (Replaced Flask routes) ---
 
@@ -825,6 +821,8 @@ def draw_tui(stdscr):
                 elif key == ord('o'):
                     SHOW_CV2_WINDOW = not SHOW_CV2_WINDOW
                     if not SHOW_CV2_WINDOW:
+                        # This call is redundant, but safe.
+                        # The video thread will handle the cleanup.
                         cv2.destroyAllWindows()
                 elif key == ord('1'):
                     set_yolo_model('n')

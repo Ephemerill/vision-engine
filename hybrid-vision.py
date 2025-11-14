@@ -84,7 +84,7 @@ data_lock = threading.Lock()
 output_frame = None
 
 # --- TUI STATE ---
-SHOW_CV2_WINDOW = False 
+# SHOW_CV2_WINDOW = False # This is no longer needed, it's handled by the main loop
 APP_SHOULD_QUIT = False
 SYSTEM_INITIALIZED = False  # Has the user run the init?
 INITIALIZING = False        # Is the init thread running?
@@ -168,7 +168,7 @@ def action_comprehension_thread():
             
             success, buffer = cv2.imencode('.jpg', current_frame)
             if not success: continue
-            b64_frame = base66.b64encode(buffer).decode('utf-8')
+            b64_frame = base64.b64encode(buffer).decode('utf-8')
             
             prompt = "";
             if current_model == MODEL_MOONDREAM:
@@ -348,7 +348,7 @@ def load_resources():
     if GFPGAN_AVAILABLE:
         try:
             gfpgan_enhancer = GFPGANer(
-                model_path='https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.3.pth',
+                model_path='https.github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.3.pth',
                 upscale=2,
                 arch='clean',
                 channel_multiplier=2,
@@ -369,7 +369,7 @@ def load_resources():
 
 # --- SOTA-Aware Video Processing Thread ---
 def video_processing_thread():
-    global data_lock, output_frame, server_data, SHOW_CV2_WINDOW, APP_SHOULD_QUIT
+    global data_lock, output_frame, server_data, APP_SHOULD_QUIT
     global analysis_results, yolo_model, person_registry, gfpgan_enhancer
     global DeepFace, dst, SOTA_AVAILABLE, GFPGAN_AVAILABLE # Need these
     
@@ -617,30 +617,15 @@ def video_processing_thread():
             output_frame = frame.copy()
             server_data["live_faces"] = live_face_payload
 
-        # --- TUI CV2 Window (MODIFIED BLOCK) ---
-        if SHOW_CV2_WINDOW:
-            try:
-                cv2.imshow("Headless Feed (Test)", frame)
-                # We MUST call waitKey for imshow to update.
-                # We do NOT check for key presses, as that fights the TUI.
-                # The user must close the window with the OS controls.
-                cv2.waitKey(1)
-            except cv2.error:
-                # This error (e.g., "Cannot open display") will be 
-                # thrown if the OS or threading model prevents it.
-                # We PASS so the thread doesn't crash and the flag 
-                # isn't set to False (which causes the flicker).
-                pass 
-        else:
-            # This is key: if the flag is false, we must destroy the window.
-            # destroyAllWindows is idempotent and safe to call.
-            cv2.destroyAllWindows()
+        # --- THIS BLOCK HAS BEEN REMOVED ---
+        # The main thread now handles cv2.imshow
+        # ---
             
     # --- End of thread loop ---
     cap.release()
     cv2.destroyAllWindows()
 
-# --- TUI HELPER FUNCTIONS (Replaced Flask routes) ---
+# --- TUI HELPER FUNCTIONS ---
 
 def toggle_action_analysis():
     global server_data, data_lock, action_thread, stop_action_thread, action_frames, last_action_frame_gray
@@ -716,34 +701,75 @@ def toggle_alignment():
         else:
             server_data['face_alignment_mode'] = 'fast'
 
-def perform_update(stdscr):
-    """Runs git pull and displays output."""
-    stdscr.nodelay(False) # Wait for keypress
-    stdscr.clear()
-    stdscr.addstr(0, 0, "Attempting to pull latest version from GitHub...")
-    stdscr.addstr(2, 0, "----------------------------------------------")
-    stdscr.refresh()
-    
+# --- NEW: Main Thread "Mode" Functions ---
+
+def run_update_mode():
+    """
+    Exits TUI and runs 'git pull' in the standard console.
+    Returns the next action for the main loop.
+    """
+    print("Attempting to pull latest version from GitHub...")
+    print("----------------------------------------------")
     try:
         process = subprocess.Popen(['git', 'pull'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         stdout, stderr = process.communicate()
         
         output = stdout + "\n" + stderr
+        print(output)
         
-        y = 4
-        for line in output.splitlines():
-            if y < curses.LINES - 2:
-                stdscr.addstr(y, 0, line[:curses.COLS-1])
-                y += 1
-            
     except Exception as e:
-        stdscr.addstr(4, 0, f"An error occurred: {e}")
+        print(f"An error occurred: {e}")
+    
+    print("----------------------------------------------")
+    input("--- Press Enter to return to TUI ---")
+    return "tui"
+
+def run_cv2_window_mode():
+    """
+    Exits TUI and opens a CV2 window in the main thread.
+    Reads frames from the global 'output_frame' populated by the video thread.
+    Returns the next action for the main loop.
+    """
+    print("Opening CV2 window... Press 'q' in the window to close.")
+    window_name = "Headless Feed (Test)"
+    
+    # Create a black placeholder image
+    placeholder = np.zeros((FRAME_HEIGHT, FRAME_WIDTH, 3), dtype=np.uint8)
+    cv2.putText(placeholder, "Waiting for frame...", (50, FRAME_HEIGHT // 2), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+    
+    while True:
+        frame_to_show = None
+        with data_lock:
+            if output_frame is not None:
+                frame_to_show = output_frame.copy()
         
-    stdscr.addstr(curses.LINES - 1, 0, "--- Press any key to return ---")
-    stdscr.refresh()
-    stdscr.getch()
-    stdscr.nodelay(True) # Go back to non-blocking
-    stdscr.clear()
+        if frame_to_show is None:
+            frame_to_show = placeholder
+        
+        try:
+            cv2.imshow(window_name, frame_to_show)
+        except cv2.error:
+             print("CV2 window error. Closing.")
+             break # Exit loop if window is force-closed
+        
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            break
+        
+        # Check if window was closed manually by the user (with the 'X' button)
+        try:
+            if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
+                break
+        except cv2.error:
+            # Window was likely destroyed
+            break
+
+    cv2.destroyAllWindows()
+    # Call waitKey again to make sure window is 100% closed on macOS
+    cv2.waitKey(1)
+    print("CV2 window closed. Returning to TUI...")
+    time.sleep(0.5) # Give time for OS to close window
+    return "tui"
 
 # --- NEW Threaded System Initializer ---
 def threaded_system_init():
@@ -778,7 +804,14 @@ def threaded_system_init():
 # --- TUI DRAWING FUNCTION ---
 
 def draw_tui(stdscr):
-    global server_data, data_lock, SHOW_CV2_WINDOW, APP_SHOULD_QUIT
+    """
+    This function runs inside the curses.wrapper()
+    It returns a string code to tell the main loop what to do next.
+    - "quit"
+    - "open_window"
+    - "update"
+    """
+    global server_data, data_lock, APP_SHOULD_QUIT
     global SYSTEM_INITIALIZED, INITIALIZING, LOADING_STATUS_MESSAGE
     
     # --- Curses setup ---
@@ -787,12 +820,16 @@ def draw_tui(stdscr):
     curses.curs_set(0) # Hide cursor
     
     # Define color pairs
-    curses.start_color()
-    curses.init_pair(1, curses.COLOR_CYAN, curses.COLOR_BLACK)
-    curses.init_pair(2, curses.COLOR_GREEN, curses.COLOR_BLACK)
-    curses.init_pair(3, curses.COLOR_YELLOW, curses.COLOR_BLACK)
-    curses.init_pair(4, curses.COLOR_RED, curses.COLOR_BLACK)
-    curses.init_pair(5, curses.COLOR_BLACK, curses.COLOR_WHITE) # Inverted for status
+    try:
+        curses.start_color()
+        curses.init_pair(1, curses.COLOR_CYAN, curses.COLOR_BLACK)
+        curses.init_pair(2, curses.COLOR_GREEN, curses.COLOR_BLACK)
+        curses.init_pair(3, curses.COLOR_YELLOW, curses.COLOR_BLACK)
+        curses.init_pair(4, curses.COLOR_RED, curses.COLOR_BLACK)
+        curses.init_pair(5, curses.COLOR_BLACK, curses.COLOR_WHITE) # Inverted for status
+    except:
+        # Fails in some minimal terminals, but is non-fatal
+        pass
     
     # --- TUI Loop ---
     while not APP_SHOULD_QUIT:
@@ -805,10 +842,12 @@ def draw_tui(stdscr):
             
             # --- Handle Global Keys (Work anytime) ---
             if key == ord('q'):
-                APP_SHOULD_QUIT = True
-                break
+                APP_SHOULD_QUIT = True # Signal video thread to stop
+                return "quit"          # Signal main loop to exit
+            
             elif key == ord('u') and not INITIALIZING:
-                perform_update(stdscr)
+                return "update"        # Signal main loop to run update
+            
             elif key == ord('i') and not SYSTEM_INITIALIZED and not INITIALIZING:
                 LOADING_STATUS_MESSAGE = "Starting initialization thread..."
                 init_thread = threading.Thread(target=threaded_system_init, daemon=True)
@@ -819,11 +858,7 @@ def draw_tui(stdscr):
                 if key == ord('s'):
                     toggle_action_analysis()
                 elif key == ord('o'):
-                    SHOW_CV2_WINDOW = not SHOW_CV2_WINDOW
-                    if not SHOW_CV2_WINDOW:
-                        # This call is redundant, but safe.
-                        # The video thread will handle the cleanup.
-                        cv2.destroyAllWindows()
+                    return "open_window" # Signal main loop to open CV2
                 elif key == ord('1'):
                     set_yolo_model('n')
                 elif key == ord('2'):
@@ -881,17 +916,17 @@ def draw_tui(stdscr):
                 yolo_str = yolo_map.get(local_data['yolo_model_key'], 'Unknown')
                 gfp_str = "ON" if local_data['face_enhancement_mode'] == 'on' else "OFF"
                 align_str = "Accurate" if local_data['face_alignment_mode'] == 'accurate' else "Fast"
-                win_str = "ON" if SHOW_CV2_WINDOW else "OFF"
+                # win_str = "ON" if SHOW_CV2_WINDOW else "OFF" # No longer needed
                 
                 status_yolo = f" YOLO: {yolo_str} "
                 status_gfp = f" GFPGAN: {gfp_str} "
                 status_align = f" Align: {align_str} "
-                status_win = f" Window: {win_str} "
+                # status_win = f" Window: {win_str} "
                 
                 stdscr.addstr(3, 1, status_yolo, curses.A_REVERSE if local_data['yolo_model_key'] != 'm' else curses.A_NORMAL)
                 stdscr.addstr(3, len(status_yolo) + 2, status_gfp, curses.A_REVERSE if local_data['face_enhancement_mode'] == 'on' else curses.A_NORMAL)
                 stdscr.addstr(3, len(status_yolo) + len(status_gfp) + 4, status_align, curses.A_REVERSE if local_data['face_alignment_mode'] == 'accurate' else curses.A_NORMAL)
-                stdscr.addstr(3, len(status_yolo) + len(status_gfp) + len(status_align) + 6, status_win, curses.A_REVERSE if SHOW_CV2_WINDOW else curses.A_NORMAL)
+                # stdscr.addstr(3, len(status_yolo) + len(status_gfp) + len(status_align) + 6, status_win, curses.A_REVERSE if SHOW_CV2_WINDOW else curses.A_NORMAL)
                 
                 # --- 3c. Main Content Panels ---
                 panel_width = max_x // 2
@@ -952,13 +987,30 @@ def draw_tui(stdscr):
             stdscr.clear()
         except KeyboardInterrupt:
             APP_SHOULD_QUIT = True
+            return "quit"
+    
+    return "quit" # Should be reached if APP_SHOULD_QUIT is set
 
 # --- Main entry point ---
 if __name__ == "__main__":
+    next_action = "tui" # Start with the TUI
+    
     try:
-        curses.wrapper(draw_tui)
+        while next_action != "quit":
+            if next_action == "tui":
+                # curses.wrapper handles init and cleanup of the terminal
+                next_action = curses.wrapper(draw_tui)
+            
+            elif next_action == "open_window":
+                # This runs in the main thread, outside of curses
+                next_action = run_cv2_window_mode()
+            
+            elif next_action == "update":
+                # This runs in the main thread, outside of curses
+                next_action = run_update_mode()
+
     finally:
-        # Cleanup
+        # Final cleanup
         APP_SHOULD_QUIT = True
         if video_thread is not None and video_thread.is_alive():
             video_thread.join(timeout=1.0) # Wait for thread to finish

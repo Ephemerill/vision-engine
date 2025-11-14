@@ -1,0 +1,15 @@
+# Core ML/CV
+opencv-python
+ultralytics
+deepface
+retina-face
+face-recognition
+numpy
+tf-keras
+
+# GFPGAN & Dependencies
+gfpgan
+git+https://github.com/XPixelGroup/BasicSR.git
+
+# AI/LLM
+ollama

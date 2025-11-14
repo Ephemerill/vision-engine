@@ -6,6 +6,7 @@ retina-face
 face-recognition
 numpy
 tf-keras
+requests
 
 # GFPGAN & Dependencies
 gfpgan

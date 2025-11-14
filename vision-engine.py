@@ -9,6 +9,7 @@ import sys
 import subprocess # For self-update
 import curses # For TUI
 import base64 # Re-added for ollama calls
+import requests # For robust HTTP streaming
 from retinaface import RetinaFace
 from ultralytics import YOLO
 
@@ -43,7 +44,13 @@ MODEL_GEMMA = 'gemma3:4b'
 MODEL_LLAVA = 'llava'
 MODEL_MOONDREAM = 'moondream'
 MODEL_OFF = 'off'
-WEBCAM_INDEX = 0
+
+# --- Video Source Configuration ---
+STREAM_WEBCAM = 0 # Default built-in webcam
+STREAM_PI_GSTREAMER = "http://127.0.0.1:8080" # From receiver.sh
+STREAM_BOUNDARY = b'--boundary' # From your receiver.sh
+# ---------------------------------------
+
 FRAME_WIDTH = 640
 FRAME_HEIGHT = 480
 KNOWN_FACES_DIR = "known_faces"
@@ -84,13 +91,13 @@ data_lock = threading.Lock()
 output_frame = None
 
 # --- TUI STATE ---
-# SHOW_CV2_WINDOW = False # This is no longer needed, it's handled by the main loop
 APP_SHOULD_QUIT = False
 SYSTEM_INITIALIZED = False  # Has the user run the init?
 INITIALIZING = False        # Is the init thread running?
 VIDEO_THREAD_STARTED = False # Is the video thread running?
 LOADING_STATUS_MESSAGE = "" # For the progress bar
 video_thread = None         # Placeholder for the video thread
+CURRENT_STREAM_SOURCE = STREAM_WEBCAM # Start with webcam by default
 # -------------------
 
 server_data = {
@@ -130,6 +137,34 @@ dst = None
 GFPGANer = None
 SOTA_AVAILABLE = False
 GFPGAN_AVAILABLE = False
+
+# --- NEW: Aspect Ratio Resize Helper ---
+def resize_with_aspect_ratio(frame, max_w=640, max_h=480):
+    """
+    Resizes an image to fit within max_w and max_h, preserving
+    its aspect ratio.
+    """
+    if frame is None:
+        return None
+        
+    h, w = frame.shape[:2]
+    
+    # If already within bounds, just return it
+    if w == 0 or h == 0:
+        return frame # Return invalid frame to be handled
+    if w <= max_w and h <= max_h:
+        return frame
+        
+    # Find the limiting ratio
+    r = min(max_w / w, max_h / h)
+    
+    new_w = int(w * r)
+    new_h = int(h * r)
+    
+    if new_w == 0 or new_h == 0:
+        return frame # Avoid crash if resize is 0
+    
+    return cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
 # --- Helper Functions (AI threads, etc.) ---
 
@@ -348,7 +383,7 @@ def load_resources():
     if GFPGAN_AVAILABLE:
         try:
             gfpgan_enhancer = GFPGANer(
-                model_path='https.github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.3.pth',
+                model_path='https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.3.pth',
                 upscale=2,
                 arch='clean',
                 channel_multiplier=2,
@@ -368,30 +403,129 @@ def load_resources():
 
 
 # --- SOTA-Aware Video Processing Thread ---
-def video_processing_thread():
+def video_processing_thread(source): 
     global data_lock, output_frame, server_data, APP_SHOULD_QUIT
     global analysis_results, yolo_model, person_registry, gfpgan_enhancer
     global DeepFace, dst, SOTA_AVAILABLE, GFPGAN_AVAILABLE # Need these
+    global LOADING_STATUS_MESSAGE, VIDEO_THREAD_STARTED # Use global for error reporting
     
-    cap = cv2.VideoCapture(WEBCAM_INDEX)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+    # --- MODIFIED: This thread now handles TWO capture methods ---
     
+    cap = None
+    frame_iter = None # For requests stream
+    
+    if source == STREAM_PI_GSTREAMER:
+        # --- METHOD 1: Use Requests for HTTP Stream ---
+        try:
+            LOADING_STATUS_MESSAGE = "Connecting to HTTP stream..."
+            r = requests.get(source, stream=True, timeout=5.0)
+            r.raise_for_status() # Fail fast if we get 404, etc.
+            
+            LOADING_STATUS_MESSAGE = "Stream connected. Reading bytes..."
+            frame_iter = r.iter_content(chunk_size=1024*10) # 10KB chunks
+            
+        except requests.exceptions.RequestException as e:
+            LOADING_STATUS_MESSAGE = f"Error: Failed to connect. Is receiver.sh running?"
+            VIDEO_THREAD_STARTED = False
+            return
+    else:
+        # --- METHOD 2: Use cv2.VideoCapture for Webcam ---
+        LOADING_STATUS_MESSAGE = "Opening webcam..."
+        cap = cv2.VideoCapture(source)
+        if not cap.isOpened():
+            LOADING_STATUS_MESSAGE = f"Error: Could not open webcam {source}."
+            VIDEO_THREAD_STARTED = False
+            return
+
+    # --- If we get here, connection was successful ---
+    LOADING_STATUS_MESSAGE = "Video source connected and open. Reading frames..."
+    time.sleep(1.0)
+    LOADING_STATUS_MESSAGE = ""
+
     frame_count = 0
     last_analysis_time = {} 
     
-    if not cap.isOpened():
-        global LOADING_STATUS_MESSAGE
-        LOADING_STATUS_MESSAGE = f"Error: Could not open webcam {WEBCAM_INDEX}. Stopping."
-        APP_SHOULD_QUIT = True
-        return
-
+    # Variables for HTTP stream parsing
+    byte_buffer = b''
+    
     while not APP_SHOULD_QUIT:
-        ret, frame = cap.read()
-        if not ret:
-            time.sleep(1.0); continue
+        
+        frame = None # Frame to be processed
+        
+        # --- Get Frame Logic ---
+        if cap:
+            # --- Webcam Logic ---
+            ret, frame = cap.read()
+            if not ret:
+                LOADING_STATUS_MESSAGE = "Error: Cannot read from webcam."
+                time.sleep(0.5)
+                continue
+        
+        elif frame_iter:
+            # --- HTTP Stream Logic (Robust Multipart Parser) ---
+            try:
+                chunk = next(frame_iter) # Get next chunk from stream
+                if not chunk:
+                    continue
+                
+                byte_buffer += chunk
+                
+                # Find start and end of a multipart frame
+                start = byte_buffer.find(STREAM_BOUNDARY)
+                end = byte_buffer.find(STREAM_BOUNDARY, start + len(STREAM_BOUNDARY))
+                
+                if start != -1 and end != -1:
+                    # We have a full part (header + JPEG)
+                    part = byte_buffer[start:end]
+                    byte_buffer = byte_buffer[end:] # Keep the rest for next loop
+                    
+                    # --- NEW ROBUST PARSING ---
+                    # Find the start and end of the JPEG *within* this part
+                    jpg_start = part.find(b'\xff\xd8')
+                    jpg_end = part.rfind(b'\xff\xd9', jpg_start) # Find LAST end *after* start
+                    
+                    if jpg_start != -1 and jpg_end != -1:
+                        # We have a complete, valid JPEG
+                        jpg = part[jpg_start:jpg_end + 2] # Slice *exactly*
+                        
+                        # Decode the JPEG bytes into an OpenCV frame
+                        frame = cv2.imdecode(np.frombuffer(jpg, dtype=np.uint8), cv2.IMREAD_COLOR)
+                        
+                        if frame is None:
+                            LOADING_STATUS_MESSAGE = "Failed to decode JPEG from stream."
+                            continue # Skip this corrupt frame
+                    # --- END OF NEW PARSING ---
+                    else:
+                        # We got a part, but no valid JPEG found inside
+                        continue
+                        
+            except requests.exceptions.ChunkedEncodingError:
+                LOADING_STATUS_MESSAGE = "Stream disconnected (ChunkedEncodingError)."
+                VIDEO_THREAD_STARTED = False
+                break # Exit thread
+            except StopIteration:
+                LOADING_STATUS_MESSAGE = "Stream ended (StopIteration)."
+                VIDEO_THREAD_STARTED = False
+                break # Exit thread
+            except Exception as e:
+                LOADING_STATUS_MESSAGE = f"Stream read error: {e}"
+                time.sleep(0.1)
+                continue
+        
+        # --- End of Get Frame Logic ---
+
+        if frame is None:
+            # If frame is still None (e.g., waiting for first full JPEG)
+            time.sleep(0.01)
+            continue
             
         frame = cv2.flip(frame, 1)
+        
+        # --- Call Aspect-Ratio-Aware Resize ---
+        frame = resize_with_aspect_ratio(frame, max_w=FRAME_WIDTH, max_h=FRAME_HEIGHT)
+        if frame is None:
+            continue # Resize failed
+        
         frame_count += 1
 
         with data_lock:
@@ -616,14 +750,16 @@ def video_processing_thread():
             global output_frame
             output_frame = frame.copy()
             server_data["live_faces"] = live_face_payload
-
-        # --- THIS BLOCK HAS BEEN REMOVED ---
-        # The main thread now handles cv2.imshow
-        # ---
             
     # --- End of thread loop ---
-    cap.release()
+    if cap:
+        cap.release()
+    if frame_iter:
+        # This will properly close the requests connection
+        frame_iter.close()
+        
     cv2.destroyAllWindows()
+    VIDEO_THREAD_STARTED = False # Mark as stopped
 
 # --- TUI HELPER FUNCTIONS ---
 
@@ -730,6 +866,13 @@ def run_cv2_window_mode():
     Reads frames from the global 'output_frame' populated by the video thread.
     Returns the next action for the main loop.
     """
+    global VIDEO_THREAD_STARTED
+    if not VIDEO_THREAD_STARTED:
+        print("Video thread is not running. Cannot open window.")
+        print("This can happen if the camera failed to initialize.")
+        time.sleep(2)
+        return "tui"
+        
     print("Opening CV2 window... Press 'q' in the window to close.")
     window_name = "Headless Feed (Test)"
     
@@ -747,10 +890,19 @@ def run_cv2_window_mode():
             frame_to_show = placeholder
         
         try:
-            cv2.imshow(window_name, frame_to_show)
-        except cv2.error:
-             print("CV2 window error. Closing.")
-             break # Exit loop if window is force-closed
+            # --- NEW: Resize here to fix aspect ratio & prevent crashes ---
+            # We resize in the preview window to not slow down the analysis thread
+            frame_to_show = resize_with_aspect_ratio(frame_to_show, max_w=1280, max_h=720) # Use larger preview
+            
+            if frame_to_show is not None:
+                cv2.imshow(window_name, frame_to_show)
+            else:
+                cv2.imshow(window_name, placeholder)
+                
+        except Exception as e:
+             # This safety net prevents a crash from a corrupt frame
+             print(f"Error displaying frame: {e}")
+             cv2.imshow(window_name, placeholder)
         
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
@@ -774,7 +926,7 @@ def run_cv2_window_mode():
 # --- NEW Threaded System Initializer ---
 def threaded_system_init():
     global INITIALIZING, SYSTEM_INITIALIZED, VIDEO_THREAD_STARTED, LOADING_STATUS_MESSAGE
-    global video_thread
+    global video_thread, CURRENT_STREAM_SOURCE
     
     INITIALIZING = True
     SYSTEM_INITIALIZED = False
@@ -786,13 +938,16 @@ def threaded_system_init():
         LOADING_STATUS_MESSAGE = "System Initialized. Starting video thread..."
         time.sleep(1.0)
         
-        video_thread = threading.Thread(target=video_processing_thread, daemon=True)
+        # <<< MODIFIED: Pass the current stream source to the thread
+        video_thread = threading.Thread(target=video_processing_thread, args=(CURRENT_STREAM_SOURCE,), daemon=True)
         video_thread.start()
         VIDEO_THREAD_STARTED = True
         
-        LOADING_STATUS_MESSAGE = "System Running."
-        time.sleep(1.0) 
-        LOADING_STATUS_MESSAGE = "" # Clear status
+        # Don't overwrite error messages from the video thread
+        if not LOADING_STATUS_MESSAGE or "Connecting" not in LOADING_STATUS_MESSAGE:
+            LOADING_STATUS_MESSAGE = "System Running."
+            time.sleep(1.0) 
+            LOADING_STATUS_MESSAGE = "" # Clear status
         
     except Exception as e:
         LOADING_STATUS_MESSAGE = f"Fatal Error on Init: {e}. System stopped."
@@ -813,6 +968,7 @@ def draw_tui(stdscr):
     """
     global server_data, data_lock, APP_SHOULD_QUIT
     global SYSTEM_INITIALIZED, INITIALIZING, LOADING_STATUS_MESSAGE
+    global video_thread, VIDEO_THREAD_STARTED, CURRENT_STREAM_SOURCE # <<< Added
     
     # --- Curses setup ---
     stdscr.nodelay(True) # Non-blocking getch
@@ -828,7 +984,6 @@ def draw_tui(stdscr):
         curses.init_pair(4, curses.COLOR_RED, curses.COLOR_BLACK)
         curses.init_pair(5, curses.COLOR_BLACK, curses.COLOR_WHITE) # Inverted for status
     except:
-        # Fails in some minimal terminals, but is non-fatal
         pass
     
     # --- TUI Loop ---
@@ -859,6 +1014,31 @@ def draw_tui(stdscr):
                     toggle_action_analysis()
                 elif key == ord('o'):
                     return "open_window" # Signal main loop to open CV2
+                
+                # <<< NEW: Video Source Toggle Logic ---
+                elif key == ord('v'):
+                    stdscr.addstr(max_y - 1, 0, "Restarting video stream... Please wait.", curses.color_pair(5))
+                    stdscr.refresh()
+                    
+                    APP_SHOULD_QUIT = True # Signal old thread to stop
+                    if video_thread is not None and video_thread.is_alive():
+                        video_thread.join(timeout=2.0) # Wait for it
+                    
+                    APP_SHOULD_QUIT = False # Reset quit flag for new thread
+                    
+                    # Toggle the source
+                    if CURRENT_STREAM_SOURCE == STREAM_WEBCAM:
+                        CURRENT_STREAM_SOURCE = STREAM_PI_GSTREAMER
+                    else:
+                        CURRENT_STREAM_SOURCE = STREAM_WEBCAM
+                    
+                    # Start new thread
+                    video_thread = threading.Thread(target=video_processing_thread, args=(CURRENT_STREAM_SOURCE,), daemon=True)
+                    video_thread.start()
+                    VIDEO_THREAD_STARTED = True
+                    stdscr.clear()
+                # --- End of Video Toggle ---
+
                 elif key == ord('1'):
                     set_yolo_model('n')
                 elif key == ord('2'):
@@ -894,7 +1074,6 @@ def draw_tui(stdscr):
                 stdscr.addstr(5, 0, "Press [u] to Self-Update (git pull).", curses.color_pair(2))
                 stdscr.addstr(6, 0, "Press [q] to Quit.", curses.color_pair(2))
                 
-                # Show error message if init failed
                 if LOADING_STATUS_MESSAGE and "Error" in LOADING_STATUS_MESSAGE:
                     stdscr.addstr(8, 0, "LAST ERROR:", curses.color_pair(4) | curses.A_BOLD)
                     stdscr.addstr(9, 0, LOADING_STATUS_MESSAGE[:max_x-1], curses.color_pair(4))
@@ -907,7 +1086,7 @@ def draw_tui(stdscr):
                 
                 # --- 3a. Header & Controls ---
                 stdscr.addstr(0, 0, "🤖 Headless Face Comprehension", curses.color_pair(1) | curses.A_BOLD)
-                controls = "[1-4] YOLO | [5] GFPGAN | [6] Align | [S]tart/Stop Analysis | [O]pen Window | [U]pdate | [Q]uit"
+                controls = "[1-4] YOLO | [5] GFPGAN | [6] Align | [V]ideo Src | [S]top Analysis | [O]pen Window | [U]pdate | [Q]uit"
                 stdscr.addstr(1, 0, controls[:max_x-1])
                 stdscr.addstr(2, 0, "─" * (max_x - 1))
 
@@ -916,17 +1095,24 @@ def draw_tui(stdscr):
                 yolo_str = yolo_map.get(local_data['yolo_model_key'], 'Unknown')
                 gfp_str = "ON" if local_data['face_enhancement_mode'] == 'on' else "OFF"
                 align_str = "Accurate" if local_data['face_alignment_mode'] == 'accurate' else "Fast"
-                # win_str = "ON" if SHOW_CV2_WINDOW else "OFF" # No longer needed
+                
+                # <<< NEW: Source String
+                source_str = "Pi Stream" if CURRENT_STREAM_SOURCE == STREAM_PI_GSTREAMER else "Webcam"
+                status_source = f" Source: {source_str} "
                 
                 status_yolo = f" YOLO: {yolo_str} "
                 status_gfp = f" GFPGAN: {gfp_str} "
                 status_align = f" Align: {align_str} "
-                # status_win = f" Window: {win_str} "
                 
-                stdscr.addstr(3, 1, status_yolo, curses.A_REVERSE if local_data['yolo_model_key'] != 'm' else curses.A_NORMAL)
-                stdscr.addstr(3, len(status_yolo) + 2, status_gfp, curses.A_REVERSE if local_data['face_enhancement_mode'] == 'on' else curses.A_NORMAL)
-                stdscr.addstr(3, len(status_yolo) + len(status_gfp) + 4, status_align, curses.A_REVERSE if local_data['face_alignment_mode'] == 'accurate' else curses.A_NORMAL)
-                # stdscr.addstr(3, len(status_yolo) + len(status_gfp) + len(status_align) + 6, status_win, curses.A_REVERSE if SHOW_CV2_WINDOW else curses.A_NORMAL)
+                # Draw status line
+                col = 1
+                stdscr.addstr(3, col, status_source, curses.A_REVERSE if CURRENT_STREAM_SOURCE == STREAM_PI_GSTREAMER else curses.A_NORMAL)
+                col += len(status_source) + 1
+                stdscr.addstr(3, col, status_yolo, curses.A_REVERSE if local_data['yolo_model_key'] != 'm' else curses.A_NORMAL)
+                col += len(status_yolo) + 1
+                stdscr.addstr(3, col, status_gfp, curses.A_REVERSE if local_data['face_enhancement_mode'] == 'on' else curses.A_NORMAL)
+                col += len(status_gfp) + 1
+                stdscr.addstr(3, col, status_align, curses.A_REVERSE if local_data['face_alignment_mode'] == 'accurate' else curses.A_NORMAL)
                 
                 # --- 3c. Main Content Panels ---
                 panel_width = max_x // 2
@@ -936,7 +1122,9 @@ def draw_tui(stdscr):
                 stdscr.addstr(6, 0, "─" * (panel_width - 2))
                 
                 live_faces = local_data.get('live_faces', [])
-                if not live_faces:
+                if not VIDEO_THREAD_STARTED:
+                    stdscr.addstr(7, 1, "Video thread is NOT running.", curses.color_pair(4))
+                elif not live_faces:
                     stdscr.addstr(7, 1, "No persons detected.", curses.A_DIM)
                 else:
                     for i, face in enumerate(live_faces):

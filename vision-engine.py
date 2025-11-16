@@ -14,6 +14,8 @@ from ultralytics import YOLO
 
 # --- NEW: Parallelism ---
 from concurrent.futures import ThreadPoolExecutor
+# --- NEW: Better Error Logging ---
+import traceback
 
 # --- GPU/Device Configuration ---
 import torch
@@ -39,8 +41,10 @@ def print_progress_bar(step, total, message, bar_length=40):
     percent = step / total
     filled_length = int(bar_length * percent)
     bar = '█' * filled_length + '-' * (bar_length - filled_length)
+    # Update the global message for the TUI to draw
     LOADING_STATUS_MESSAGE = f'[Step {step}/{total}] |{bar}| {int(percent*100)}% - {message}'
     if step == total:
+        LOADING_STATUS_MESSAGE = f'[Step {step}/{total}] |{bar}| 100% - {message}'
         LOADING_STATUS_MESSAGE += "\nAll models and faces loaded!"
 # ------------------------------------
 
@@ -53,8 +57,7 @@ MODEL_OFF = 'off'
 # --- Video Source Configuration ---
 STREAM_WEBCAM = 0 # Default built-in webcam
 
-# --- <<< IP ADDRESS FIX >>> ---
-# This was the most likely cause of the 30-second timeout.
+# --- <<< IP ADDRESS CHECK >>> ---
 # Please double-check this is your Pi's correct Tailscale IP.
 STREAM_PI_TAILSCALE_IP = "100.114.210.58" 
 STREAM_PI_RTSP = f"rtsp://{STREAM_PI_TAILSCALE_IP}:8554/cam"
@@ -305,17 +308,13 @@ def get_containing_body_box(face_box, body_boxes):
             return track_id
     return None
 
-# --- <<< MODIFIED: Parallel Resource Loading >>> ---
-def load_resources():
-    """Loads all ML models and known faces in parallel."""
-    global yolo_model, gfpgan_enhancer, MAX_RECOGNITION_DISTANCE, SOTA_MODEL, SOTA_METRIC, DEFAULT_RECOGNITION_THRESHOLD
-    global DeepFace, dst, GFPGANer, SOTA_AVAILABLE, GFPGAN_AVAILABLE, DEVICE
-    
-    TOTAL_LOAD_STEPS = 5 # Added a step for imports
-    print_progress_bar(0, TOTAL_LOAD_STEPS, "Initializing...")
+# --- <<< MODIFIED: Sequential, Verbose Resource Loading >>> ---
+# We've broken the parallel loader into sequential, logged steps
+# to easily identify hangs and errors.
 
-    # --- Step 1: Perform Heavy Imports ---
-    print_progress_bar(1, TOTAL_LOAD_STEPS, "Importing ML libraries...")
+def _load_imports():
+    global DeepFace, dst, GFPGANer, SOTA_AVAILABLE, GFPGAN_AVAILABLE
+    print_progress_bar(1, 6, "Importing heavy libraries...")
     try:
         from deepface import DeepFace as DF_Import
         DeepFace = DF_Import
@@ -333,61 +332,45 @@ def load_resources():
         GFPGAN_AVAILABLE = False
         with data_lock:
             server_data["face_enhancement_mode"] = "off_disabled"
-    
-    # --- Define individual loader functions ---
-    def _load_deepface():
-        global SOTA_MODEL, SOTA_METRIC, MAX_RECOGNITION_DISTANCE, DEFAULT_RECOGNITION_THRESHOLD
-        print_progress_bar(2, TOTAL_LOAD_STEPS, "Loading SOTA Model (ArcFace)...")
-        if SOTA_AVAILABLE:
-            try:
-                DeepFace.build_model(SOTA_MODEL)
-                MAX_RECOGNITION_DISTANCE = dst.find_threshold(SOTA_MODEL, SOTA_METRIC) 
-            except Exception as e:
-                SOTA_MODEL = "Dlib"; SOTA_METRIC = "euclidean"; MAX_RECOGNITION_DISTANCE = 0.6
-        else:
+
+def _load_deepface():
+    global SOTA_MODEL, SOTA_METRIC, MAX_RECOGNITION_DISTANCE, DEFAULT_RECOGNITION_THRESHOLD
+    print_progress_bar(2, 6, "Loading SOTA Model (ArcFace)...")
+    if SOTA_AVAILABLE:
+        try:
+            DeepFace.build_model(SOTA_MODEL)
+            MAX_RECOGNITION_DISTANCE = dst.find_threshold(SOTA_MODEL, SOTA_METRIC) 
+        except Exception as e:
             SOTA_MODEL = "Dlib"; SOTA_METRIC = "euclidean"; MAX_RECOGNITION_DISTANCE = 0.6
-        DEFAULT_RECOGNITION_THRESHOLD = MAX_RECOGNITION_DISTANCE
-        with data_lock:
-            server_data["recognition_threshold"] = DEFAULT_RECOGNITION_THRESHOLD
+    else:
+        SOTA_MODEL = "Dlib"; SOTA_METRIC = "euclidean"; MAX_RECOGNITION_DISTANCE = 0.6
+    DEFAULT_RECOGNITION_THRESHOLD = MAX_RECOGNITION_DISTANCE
+    with data_lock:
+        server_data["recognition_threshold"] = DEFAULT_RECOGNITION_THRESHOLD
 
-    def _load_yolo():
-        global yolo_model
-        print_progress_bar(3, TOTAL_LOAD_STEPS, f"Loading YOLO Model to {DEVICE}...")
-        yolo_model = YOLO(YOLO_MODELS[server_data['yolo_model_key']], verbose=False)
-        yolo_model.to(DEVICE)
+def _load_yolo():
+    global yolo_model
+    print_progress_bar(3, 6, f"Loading YOLO Model to {DEVICE}...")
+    yolo_model = YOLO(YOLO_MODELS[server_data['yolo_model_key']], verbose=False)
+    yolo_model.to(DEVICE)
 
-    def _load_gfpgan():
-        global gfpgan_enhancer
-        print_progress_bar(4, TOTAL_LOAD_STEPS, f"Loading GFPGAN Model to {DEVICE}...")
-        if GFPGAN_AVAILABLE:
-            try:
-                gfpgan_enhancer = GFPGANer(
-                    model_path='https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.3.pth',
-                    upscale=2, arch='clean', channel_multiplier=2, bg_upsampler=None, device=DEVICE
-                )
-            except Exception as e:
-                with data_lock: server_data["face_enhancement_mode"] = "off_disabled"
-    
-    def _load_faces():
-        print_progress_bar(5, TOTAL_LOAD_STEPS, "Loading Known Faces...")
-        load_known_faces(KNOWN_FACES_DIR)
+def _load_gfpgan():
+    global gfpgan_enhancer
+    print_progress_bar(4, 6, f"Loading GFPGAN Model to {DEVICE}...")
+    if GFPGAN_AVAILABLE:
+        try:
+            gfpgan_enhancer = GFPGANer(
+                model_path='https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.3.pth',
+                upscale=2, arch='clean', channel_multiplier=2, bg_upsampler=None, device=DEVICE
+            )
+        except Exception as e:
+            with data_lock: server_data["face_enhancement_mode"] = "off_disabled"
 
-    # --- Run loaders in parallel ---
-    # We use 4 workers to load all 4 components at the same time
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        futures = [
-            executor.submit(_load_deepface),
-            executor.submit(_load_yolo),
-            executor.submit(_load_gfpgan),
-            executor.submit(_load_faces)
-        ]
-        # Wait for all to complete
-        for future in futures:
-            future.result() # This will re-raise exceptions if any loader failed
+def _load_faces():
+    print_progress_bar(5, 6, "Loading Known Faces...")
+    load_known_faces(KNOWN_FACES_DIR)
 
-    # --- Finish ---
-    print_progress_bar(TOTAL_LOAD_STEPS, TOTAL_LOAD_STEPS, "All models and faces loaded!")
-    time.sleep(0.5)
+# --- <<< END of new loading functions >>> ---
 
 
 # --- <<< NEW: FRAME READER (PRODUCER) THREAD >>> ---
@@ -400,18 +383,23 @@ def _frame_reader_loop(source):
     
     cap = None
     try:
-        LOADING_STATUS_MESSAGE = f"Opening video source: {source}"
+        # --- MODIFIED: Set a 5-second timeout on the connection ---
+        # This will prevent the 30-second hang if the IP is wrong
+        # We use a custom environment variable for OpenCV
+        os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = 'rtsp_transport;tcp;stimeout;5000000'
+        LOADING_STATUS_MESSAGE = f"Attempting to connect to stream: {source}"
         cap = cv2.VideoCapture(source)
         if not cap.isOpened():
-            LOADING_STATUS_MESSAGE = f"Error: Could not open video source {source}."
+            LOADING_STATUS_MESSAGE = f"Error: Could not open video source {source}. Check IP/firewall."
             VIDEO_THREAD_STARTED = False # Graceful failure
             return
 
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         VIDEO_THREAD_STARTED = True # Mark as started *only after* cap is open
+        LOADING_STATUS_MESSAGE = "Video stream connected."
         
     except Exception as e:
-        LOADING_STATUS_MESSAGE = f"Error opening source: {e}"
+        LOADING_STATUS_MESSAGE = f"Error opening source: {e}\n{traceback.format_exc()}"
         VIDEO_THREAD_STARTED = False # Graceful failure
         return
 
@@ -451,7 +439,6 @@ def video_processing_thread():
     global DeepFace, dst, SOTA_AVAILABLE, GFPGAN_AVAILABLE, DEVICE
     global LOADING_STATUS_MESSAGE, VIDEO_THREAD_STARTED
     
-    LOADING_STATUS_MESSAGE = "Video processor started. Waiting for frames..."
     frame_count = 0
     last_analysis_time = {} 
 
@@ -520,6 +507,10 @@ def video_processing_thread():
         
         return (face_location, name, confidence)
     # --- <<< End of helper function >>> ---
+
+    # Wait until the models are loaded before starting
+    while INITIALIZING and not APP_SHOULD_QUIT:
+        time.sleep(0.1)
 
     while not APP_SHOULD_QUIT:
         
@@ -791,28 +782,45 @@ def threaded_system_init():
     VIDEO_THREAD_STARTED = False
     
     try:
-        # --- <<< MODIFIED: Start video threads *before* loading models >>> ---
-        LOADING_STATUS_MESSAGE = "Attempting to connect to video stream..."
+        # --- MODIFIED: Start video threads *first* to check connection ---
+        print_progress_bar(0, 6, "Connecting to video stream...")
         latest_raw_frame = None 
 
         reader_thread = threading.Thread(target=_frame_reader_loop, args=(CURRENT_STREAM_SOURCE,), daemon=True)
         reader_thread.start()
 
+        # Give the reader 5 seconds to connect
+        connect_timeout = 5.0
+        start_time = time.time()
+        while not VIDEO_THREAD_STARTED and (time.time() - start_time) < connect_timeout:
+            if not reader_thread.is_alive(): # Reader thread failed and exited
+                break
+            time.sleep(0.1)
+
+        if not VIDEO_THREAD_STARTED:
+            # If it's still not started, it failed
+            LOADING_STATUS_MESSAGE += "\n\nConnection failed. Please check IP and restart."
+            INITIALIZING = False
+            return # Exit the init thread
+        
+        # --- If connection is good, start processor and load models ---
         video_thread = threading.Thread(target=video_processing_thread, args=(), daemon=True)
         video_thread.start()
-        # VIDEO_THREAD_STARTED is now set by the reader_thread itself
+
+        # --- Now, load resources sequentially and with error logging ---
+        _load_imports()
+        _load_deepface()
+        _load_yolo()
+        _load_gfpgan()
+        _load_faces()
         
-        # --- Now, load resources in parallel while stream connects ---
-        load_resources() # This will block, but the stream is connecting in the background
-        
+        print_progress_bar(6, 6, "System Running.")
         SYSTEM_INITIALIZED = True
-        
-        if not LOADING_STATUS_MESSAGE or "Connecting" not in LOADING_STATUS_MESSAGE:
-            LOADING_STATUS_MESSAGE = "System Running."
-            time.sleep(1.0); LOADING_STATUS_MESSAGE = ""
+        time.sleep(1.0); LOADING_STATUS_MESSAGE = ""
         
     except Exception as e:
-        LOADING_STATUS_MESSAGE = f"Fatal Error on Init: {e}. System stopped."
+        # This will catch any error from the loading functions
+        LOADING_STATUS_MESSAGE = f"FATAL ERROR during init:\n{e}\n{traceback.format_exc()}"
         SYSTEM_INITIALIZED = False
     finally:
         INITIALIZING = False
@@ -890,10 +898,15 @@ def draw_tui(stdscr):
             if INITIALIZING:
                 stdscr.addstr(0, 0, "🤖 Initializing System...", curses.color_pair(3) | curses.A_BOLD)
                 y = 2
+                # --- MODIFIED: Show multi-line error messages ---
                 for line in LOADING_STATUS_MESSAGE.splitlines():
                     if y >= max_y - 2: break
                     stdscr.addstr(y, 0, line[:max_x-1]); y += 1
-                stdscr.addstr(max_y - 1, 0, "Please wait... (This can take a minute)")
+                
+                if "FATAL ERROR" in LOADING_STATUS_MESSAGE:
+                    stdscr.addstr(y+1, 0, "Initialization failed. Press 'q' to quit.")
+                elif "Connection failed" in LOADING_STATUS_MESSAGE:
+                     stdscr.addstr(y+1, 0, "Press 'q' to quit or 'i' to retry.")
 
             elif not SYSTEM_INITIALIZED:
                 stdscr.addstr(0, 0, "🤖 Headless Face Comprehension", curses.color_pair(1) | curses.A_BOLD)
@@ -902,9 +915,12 @@ def draw_tui(stdscr):
                 stdscr.addstr(5, 0, "Press [i] to Initialize System.", curses.color_pair(2) | curses.A_BOLD)
                 stdscr.addstr(6, 0, "Press [u] to Self-Update (git pull).", curses.color_pair(2))
                 stdscr.addstr(7, 0, "Press [q] to Quit.", curses.color_pair(2))
-                if LOADING_STATUS_MESSAGE and "Error" in LOADING_STATUS_MESSAGE:
-                    stdscr.addstr(9, 0, "LAST ERROR:", curses.color_pair(4) | curses.A_BOLD)
-                    stdscr.addstr(10, 0, LOADING_STATUS_MESSAGE[:max_x-1], curses.color_pair(4))
+                if LOADING_STATUS_MESSAGE and ("Error" in LOADING_STATUS_MESSAGE or "failed" in LOADING_STATUS_MESSAGE):
+                    stdscr.addstr(9, 0, "LAST STATUS:", curses.color_pair(4) | curses.A_BOLD)
+                    y = 10
+                    for line in LOADING_STATUS_MESSAGE.splitlines():
+                        if y >= max_y - 2: break
+                        stdscr.addstr(y, 0, line[:max_x-1], curses.color_pair(4)); y += 1
 
             else:
                 with data_lock: local_data = server_data.copy()
@@ -996,4 +1012,7 @@ if __name__ == "__main__":
         if video_thread is not None and video_thread.is_alive():
             video_thread.join(timeout=1.0) 
         cv2.destroyAllWindows()
-        print("Application shut down cleanly.")
+        # --- MODIFIED: Print a clean exit message ---
+        # The 'Application shut down cleanly' was part of the problem.
+        # Now we print a specific exit message.
+        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Application shut down.")

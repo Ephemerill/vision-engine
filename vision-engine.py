@@ -54,9 +54,6 @@ STREAM_PI_TAILSCALE_IP = "100.114.210.58"
 
 # This builds the RTSP URL your Python script will read
 STREAM_PI_RTSP = f"rtsp://{STREAM_PI_TAILSCALE_IP}:8554/cam"
-
-# REMOVED: STREAM_PI_GSTREAMER = "http://127.0.0.1:8080"
-# REMOVED: STREAM_BOUNDARY = b'--boundary'
 # <<< ---------------------------------- >>>
 
 FRAME_WIDTH = 640
@@ -97,6 +94,7 @@ YOLO_MODELS = {
 # --- Global Server State ---
 data_lock = threading.Lock()
 output_frame = None
+latest_raw_frame = None # <<< NEW: For the reader thread
 
 # --- TUI STATE ---
 APP_SHOULD_QUIT = False
@@ -104,7 +102,8 @@ SYSTEM_INITIALIZED = False  # Has the user run the init?
 INITIALIZING = False        # Is the init thread running?
 VIDEO_THREAD_STARTED = False # Is the video thread running?
 LOADING_STATUS_MESSAGE = "" # For the progress bar
-video_thread = None         # Placeholder for the video thread
+video_thread = None         # Placeholder for the video (processor) thread
+reader_thread = None        # <<< NEW: Placeholder for the (reader) thread
 CURRENT_STREAM_SOURCE = STREAM_WEBCAM # Start with webcam by default
 # -------------------
 
@@ -410,80 +409,94 @@ def load_resources():
     time.sleep(0.5)
 
 
-# --- SOTA-Aware Video Processing Thread ---
-def video_processing_thread(source): 
-    global data_lock, output_frame, server_data, APP_SHOULD_QUIT
-    global analysis_results, yolo_model, person_registry, gfpgan_enhancer
-    global DeepFace, dst, SOTA_AVAILABLE, GFPGAN_AVAILABLE # Need these
-    global LOADING_STATUS_MESSAGE, VIDEO_THREAD_STARTED # Use global for error reporting
-    
-    # --- MODIFIED: Unified Video Capture ---
-    # Both webcam (0) and RTSP URLs are handled by cv2.VideoCapture
+# --- <<< NEW: FRAME READER (PRODUCER) THREAD >>> ---
+def _frame_reader_loop(source):
+    """
+    This is the "Reader" thread.
+    Its only job is to read frames from the source and update latest_raw_frame.
+    """
+    global latest_raw_frame, data_lock, APP_SHOULD_QUIT, LOADING_STATUS_MESSAGE
     
     cap = None
-    
     try:
         LOADING_STATUS_MESSAGE = f"Opening video source: {source}"
-        # This one function handles local device numbers OR network URLs
         cap = cv2.VideoCapture(source)
-        
+        if not cap.isOpened():
+            LOADING_STATUS_MESSAGE = f"Error: Could not open video source {source}."
+            return
+
         # Set a small buffer. This is crucial for low-latency on RTSP
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
+        
     except Exception as e:
         LOADING_STATUS_MESSAGE = f"Error opening source: {e}"
-        VIDEO_THREAD_STARTED = False
         return
-
-    if not cap.isOpened():
-        LOADING_STATUS_MESSAGE = f"Error: Could not open video source {source}."
-        VIDEO_THREAD_STARTED = False
-        return
-    
-    # --- If we get here, connection was successful ---
-    LOADING_STATUS_MESSAGE = "Video source connected and open. Reading frames..."
-    time.sleep(1.0)
-    LOADING_STATUS_MESSAGE = ""
-
-    frame_count = 0
-    last_analysis_time = {} 
-    
-    # REMOVED: byte_buffer and multipart parsing logic
 
     while not APP_SHOULD_QUIT:
-        
-        frame = None # Frame to be processed
-        
-        # --- Get Frame Logic (Unified) ---
         try:
             ret, frame = cap.read()
             if not ret:
-                LOADING_STATUS_MESSAGE = "Error: Cannot read frame from stream. Reconnecting..."
-                # Attempt to reopen the stream if it fails
+                LOADING_STATUS_MESSAGE = "Error: Cannot read frame. Reconnecting..."
+                # Attempt to reopen the stream
                 cap.release()
                 cap = cv2.VideoCapture(source)
                 cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                 time.sleep(0.5)
                 continue
+            
+            # If successful, update the global frame
+            with data_lock:
+                global latest_raw_frame
+                latest_raw_frame = frame
                 
         except Exception as e:
             LOADING_STATUS_MESSAGE = f"Stream read error: {e}"
             time.sleep(0.1)
-            continue
+    
+    if cap:
+        cap.release()
+    LOADING_STATUS_MESSAGE = "Reader thread stopped."
+
+
+# --- <<< MODIFIED: VIDEO PROCESSOR (CONSUMER) THREAD >>> ---
+def video_processing_thread(): 
+    """
+    This is the "Processor" thread.
+    It reads from latest_raw_frame, processes, and updates output_frame.
+    """
+    global data_lock, output_frame, server_data, APP_SHOULD_QUIT, latest_raw_frame
+    global analysis_results, yolo_model, person_registry, gfpgan_enhancer
+    global DeepFace, dst, SOTA_AVAILABLE, GFPGAN_AVAILABLE # Need these
+    global LOADING_STATUS_MESSAGE, VIDEO_THREAD_STARTED # Use global for error reporting
+    
+    # --- REMOVED: All cap.open() and cap.read() logic ---
+
+    LOADING_STATUS_MESSAGE = "Video processor started. Waiting for frames..."
+    frame_count = 0
+    last_analysis_time = {} 
+
+    while not APP_SHOULD_QUIT:
+        
+        frame = None
+        
+        # --- Get Frame Logic (from global variable) ---
+        with data_lock:
+            if latest_raw_frame is None:
+                # Wait for the reader thread to provide the first frame
+                time.sleep(0.1)
+                continue
+            
+            # Always grab the *latest* available frame
+            frame = latest_raw_frame.copy()
         
         # --- End of Get Frame Logic ---
-
-        if frame is None:
-            # If frame is still None
-            time.sleep(0.01)
-            continue
             
         frame = cv2.flip(frame, 1)
         
         # --- Call Aspect-Ratio-Aware Resize ---
         frame = resize_with_aspect_ratio(frame, max_w=FRAME_WIDTH, max_h=FRAME_HEIGHT)
         if frame is None:
-            continue # Resize failed
+            continue # Resize failed or corrupt frame
         
         frame_count += 1
 
@@ -711,11 +724,9 @@ def video_processing_thread(source):
             server_data["live_faces"] = live_face_payload
             
     # --- End of thread loop ---
-    if cap:
-        cap.release()
-        
     cv2.destroyAllWindows()
     VIDEO_THREAD_STARTED = False # Mark as stopped
+    LOADING_STATUS_MESSAGE = "Processor thread stopped."
 
 # --- TUI HELPER FUNCTIONS ---
 
@@ -879,10 +890,10 @@ def run_cv2_window_mode():
     time.sleep(0.5) # Give time for OS to close window
     return "tui"
 
-# --- NEW Threaded System Initializer ---
+# --- <<< MODIFIED: Threaded System Initializer >>> ---
 def threaded_system_init():
     global INITIALIZING, SYSTEM_INITIALIZED, VIDEO_THREAD_STARTED, LOADING_STATUS_MESSAGE
-    global video_thread, CURRENT_STREAM_SOURCE
+    global video_thread, reader_thread, CURRENT_STREAM_SOURCE, latest_raw_frame
     
     INITIALIZING = True
     SYSTEM_INITIALIZED = False
@@ -891,12 +902,20 @@ def threaded_system_init():
     try:
         load_resources() # This populates LOADING_STATUS_MESSAGE
         SYSTEM_INITIALIZED = True
-        LOADING_STATUS_MESSAGE = "System Initialized. Starting video thread..."
+        LOADING_STATUS_MESSAGE = "System Initialized. Starting video threads..."
         time.sleep(1.0)
         
-        # <<< MODIFIED: Pass the current stream source to the thread
-        video_thread = threading.Thread(target=video_processing_thread, args=(CURRENT_STREAM_SOURCE,), daemon=True)
+        latest_raw_frame = None # Ensure frame is clear before starting
+
+        # <<< NEW: Start BOTH threads >>>
+        # 1. Start the Reader (Producer)
+        reader_thread = threading.Thread(target=_frame_reader_loop, args=(CURRENT_STREAM_SOURCE,), daemon=True)
+        reader_thread.start()
+
+        # 2. Start the Processor (Consumer)
+        video_thread = threading.Thread(target=video_processing_thread, args=(), daemon=True)
         video_thread.start()
+        
         VIDEO_THREAD_STARTED = True
         
         # Don't overwrite error messages from the video thread
@@ -924,7 +943,7 @@ def draw_tui(stdscr):
     """
     global server_data, data_lock, APP_SHOULD_QUIT
     global SYSTEM_INITIALIZED, INITIALIZING, LOADING_STATUS_MESSAGE
-    global video_thread, VIDEO_THREAD_STARTED, CURRENT_STREAM_SOURCE # <<< Added
+    global video_thread, reader_thread, VIDEO_THREAD_STARTED, CURRENT_STREAM_SOURCE, latest_raw_frame
     
     # --- Curses setup ---
     stdscr.nodelay(True) # Non-blocking getch
@@ -953,7 +972,7 @@ def draw_tui(stdscr):
             
             # --- Handle Global Keys (Work anytime) ---
             if key == ord('q'):
-                APP_SHOULD_QUIT = True # Signal video thread to stop
+                APP_SHOULD_QUIT = True # Signal all threads to stop
                 return "quit"          # Signal main loop to exit
             
             elif key == ord('u') and not INITIALIZING:
@@ -971,26 +990,37 @@ def draw_tui(stdscr):
                 elif key == ord('o'):
                     return "open_window" # Signal main loop to open CV2
                 
-                # <<< NEW: Video Source Toggle Logic ---
+                # <<< MODIFIED: Video Source Toggle Logic ---
                 elif key == ord('v'):
                     stdscr.addstr(max_y - 1, 0, "Restarting video stream... Please wait.", curses.color_pair(5))
                     stdscr.refresh()
                     
-                    APP_SHOULD_QUIT = True # Signal old thread to stop
-                    if video_thread is not None and video_thread.is_alive():
-                        video_thread.join(timeout=2.0) # Wait for it
+                    APP_SHOULD_QUIT = True # Signal old threads to stop
                     
-                    APP_SHOULD_QUIT = False # Reset quit flag for new thread
+                    # Wait for both threads to stop
+                    if reader_thread is not None and reader_thread.is_alive():
+                        reader_thread.join(timeout=1.0)
+                    if video_thread is not None and video_thread.is_alive():
+                        video_thread.join(timeout=1.0) 
+                    
+                    APP_SHOULD_QUIT = False # Reset quit flag for new threads
                     
                     # Toggle the source
                     if CURRENT_STREAM_SOURCE == STREAM_WEBCAM:
-                        CURRENT_STREAM_SOURCE = STREAM_PI_RTSP # <<< MODIFIED
+                        CURRENT_STREAM_SOURCE = STREAM_PI_RTSP
                     else:
                         CURRENT_STREAM_SOURCE = STREAM_WEBCAM
                     
-                    # Start new thread
-                    video_thread = threading.Thread(target=video_processing_thread, args=(CURRENT_STREAM_SOURCE,), daemon=True)
+                    # Clear last frame
+                    with data_lock:
+                        latest_raw_frame = None 
+                    
+                    # Start new threads
+                    reader_thread = threading.Thread(target=_frame_reader_loop, args=(CURRENT_STREAM_SOURCE,), daemon=True)
+                    reader_thread.start()
+                    video_thread = threading.Thread(target=video_processing_thread, args=(), daemon=True)
                     video_thread.start()
+                    
                     VIDEO_THREAD_STARTED = True
                     stdscr.clear()
                 # --- End of Video Toggle ---
@@ -1156,7 +1186,12 @@ if __name__ == "__main__":
     finally:
         # Final cleanup
         APP_SHOULD_QUIT = True
+        
+        # <<< MODIFIED: Join both threads >>>
+        if reader_thread is not None and reader_thread.is_alive():
+            reader_thread.join(timeout=1.0)
         if video_thread is not None and video_thread.is_alive():
-            video_thread.join(timeout=1.0) # Wait for thread to finish
+            video_thread.join(timeout=1.0) 
+            
         cv2.destroyAllWindows()
         print("Application shut down cleanly.")

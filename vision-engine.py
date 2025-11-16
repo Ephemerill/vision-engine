@@ -1069,7 +1069,7 @@ def draw_tui(stdscr):
 
             # --- 2. Draw "Idle" Screen ---
             elif not SYSTEM_INITIALIZED:
-                stdscr.addstr(0, 0, "🤖 Headless Face Comprehension", curses.color_pair(1) | curses.A_BOLD)
+                stdscr.addstr(0, 0, "🤖 Headless Face Comprehension v0.1", curses.color_pair(1) | curses.A_BOLD)
                 stdscr.addstr(1, 0, TUI_INFO_MESSAGE, curses.A_DIM) # <<< Show device info
                 stdscr.addstr(3, 0, "System is IDLE.", curses.A_DIM)
                 stdscr.addstr(5, 0, "Press [i] to Initialize System.", curses.color_pair(2) | curses.A_BOLD)

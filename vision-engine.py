@@ -9,9 +9,15 @@ import sys
 import subprocess # For self-update
 import curses # For TUI
 import base64 # Re-added for ollama calls
-# import requests # No longer needed for streaming
 from retinaface import RetinaFace
 from ultralytics import YOLO
+
+# --- NEW: GPU/Device Configuration ---
+# This is the most important change for optimization
+import torch
+DEVICE = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+TUI_INFO_MESSAGE = f"Using Device: {DEVICE}" # For display in TUI
+# -------------------------------------
 
 # --- New SOTA Imports (with better error handling) ---
 try:
@@ -48,13 +54,11 @@ MODEL_OFF = 'off'
 # --- Video Source Configuration ---
 STREAM_WEBCAM = 0 # Default built-in webcam
 
-# <<< --- MODIFIED FOR RTSP STREAM --- >>>
 # SET YOUR PI'S TAILSCALE IP HERE
 STREAM_PI_TAILSCALE_IP = "100.114.210.58" 
 
 # This builds the RTSP URL your Python script will read
 STREAM_PI_RTSP = f"rtsp://{STREAM_PI_TAILSCALE_IP}:8554/cam"
-# <<< ---------------------------------- >>>
 
 FRAME_WIDTH = 640
 FRAME_HEIGHT = 480
@@ -94,7 +98,7 @@ YOLO_MODELS = {
 # --- Global Server State ---
 data_lock = threading.Lock()
 output_frame = None
-latest_raw_frame = None # <<< NEW: For the reader thread
+latest_raw_frame = None # For the reader thread
 
 # --- TUI STATE ---
 APP_SHOULD_QUIT = False
@@ -103,10 +107,12 @@ INITIALIZING = False        # Is the init thread running?
 VIDEO_THREAD_STARTED = False # Is the video thread running?
 LOADING_STATUS_MESSAGE = "" # For the progress bar
 video_thread = None         # Placeholder for the video (processor) thread
-reader_thread = None        # <<< NEW: Placeholder for the (reader) thread
-CURRENT_STREAM_SOURCE = STREAM_WEBCAM # Start with webcam by default
-# -------------------
+reader_thread = None        # Placeholder for the (reader) thread
 
+# --- MODIFIED: Default to Pi Stream ---
+CURRENT_STREAM_SOURCE = STREAM_PI_RTSP
+# --------------------------------------
+    
 server_data = {
     "is_recording": False,
     "keyframe_count": 0,
@@ -273,6 +279,7 @@ def load_known_faces(known_faces_dir):
                 if filename.lower().endswith((".jpg", ".png", ".jpeg")):
                     image_path = os.path.join(person_dir, filename)
                     try:
+                        # DeepFace will automatically use the GPU if available
                         representation = DeepFace.represent(
                             img_path=image_path, 
                             model_name=SOTA_MODEL,
@@ -335,7 +342,7 @@ def get_containing_body_box(face_box, body_boxes):
 def load_resources():
     """Loads all ML models and known faces. Called by the init thread."""
     global yolo_model, gfpgan_enhancer, MAX_RECOGNITION_DISTANCE, SOTA_MODEL, SOTA_METRIC, DEFAULT_RECOGNITION_THRESHOLD
-    global DeepFace, dst, GFPGANer, SOTA_AVAILABLE, GFPGAN_AVAILABLE
+    global DeepFace, dst, GFPGANer, SOTA_AVAILABLE, GFPGAN_AVAILABLE, DEVICE
     
     TOTAL_LOAD_STEPS = 4
     print_progress_bar(0, TOTAL_LOAD_STEPS, "Initializing...")
@@ -366,6 +373,7 @@ def load_resources():
     print_progress_bar(2, TOTAL_LOAD_STEPS, "Loading SOTA Model (ArcFace)...")
     if SOTA_AVAILABLE:
         try:
+            # DeepFace.build_model will auto-use GPU if available
             DeepFace.build_model(SOTA_MODEL)
             MAX_RECOGNITION_DISTANCE = dst.find_threshold(SOTA_MODEL, SOTA_METRIC) 
         except Exception as e:
@@ -381,12 +389,13 @@ def load_resources():
     with data_lock:
         server_data["recognition_threshold"] = DEFAULT_RECOGNITION_THRESHOLD
 
-    # --- Step 3: Load YOLO Model ---
-    print_progress_bar(3, TOTAL_LOAD_STEPS, "Loading YOLO Model...")
+    # --- Step 3: Load YOLO Model (Optimized) ---
+    print_progress_bar(3, TOTAL_LOAD_STEPS, f"Loading YOLO Model to {DEVICE}...")
     yolo_model = YOLO(YOLO_MODELS[server_data['yolo_model_key']], verbose=False)
+    yolo_model.to(DEVICE) # <<< MOVES MODEL TO GPU
 
-    # --- Step 4: Load GFPGAN Model ---
-    print_progress_bar(4, TOTAL_LOAD_STEPS, "Loading GFPGAN Model...")
+    # --- Step 4: Load GFPGAN Model (Optimized) ---
+    print_progress_bar(4, TOTAL_LOAD_STEPS, f"Loading GFPGAN Model to {DEVICE}...")
     if GFPGAN_AVAILABLE:
         try:
             gfpgan_enhancer = GFPGANer(
@@ -394,7 +403,8 @@ def load_resources():
                 upscale=2,
                 arch='clean',
                 channel_multiplier=2,
-                bg_upsampler=None
+                bg_upsampler=None,
+                device=DEVICE # <<< MOVES MODEL TO GPU
             )
         except Exception as e:
             with data_lock:
@@ -415,7 +425,7 @@ def _frame_reader_loop(source):
     This is the "Reader" thread.
     Its only job is to read frames from the source and update latest_raw_frame.
     """
-    global latest_raw_frame, data_lock, APP_SHOULD_QUIT, LOADING_STATUS_MESSAGE
+    global latest_raw_frame, data_lock, APP_SHOULD_QUIT, LOADING_STATUS_MESSAGE, VIDEO_THREAD_STARTED
     
     cap = None
     try:
@@ -423,6 +433,7 @@ def _frame_reader_loop(source):
         cap = cv2.VideoCapture(source)
         if not cap.isOpened():
             LOADING_STATUS_MESSAGE = f"Error: Could not open video source {source}."
+            VIDEO_THREAD_STARTED = False # <<< Graceful failure
             return
 
         # Set a small buffer. This is crucial for low-latency on RTSP
@@ -430,6 +441,7 @@ def _frame_reader_loop(source):
         
     except Exception as e:
         LOADING_STATUS_MESSAGE = f"Error opening source: {e}"
+        VIDEO_THREAD_STARTED = False # <<< Graceful failure
         return
 
     while not APP_SHOULD_QUIT:
@@ -456,6 +468,7 @@ def _frame_reader_loop(source):
     if cap:
         cap.release()
     LOADING_STATUS_MESSAGE = "Reader thread stopped."
+    VIDEO_THREAD_STARTED = False # <<< Graceful failure
 
 
 # --- <<< MODIFIED: VIDEO PROCESSOR (CONSUMER) THREAD >>> ---
@@ -466,11 +479,9 @@ def video_processing_thread():
     """
     global data_lock, output_frame, server_data, APP_SHOULD_QUIT, latest_raw_frame
     global analysis_results, yolo_model, person_registry, gfpgan_enhancer
-    global DeepFace, dst, SOTA_AVAILABLE, GFPGAN_AVAILABLE # Need these
-    global LOADING_STATUS_MESSAGE, VIDEO_THREAD_STARTED # Use global for error reporting
+    global DeepFace, dst, SOTA_AVAILABLE, GFPGAN_AVAILABLE, DEVICE
+    global LOADING_STATUS_MESSAGE, VIDEO_THREAD_STARTED
     
-    # --- REMOVED: All cap.open() and cap.read() logic ---
-
     LOADING_STATUS_MESSAGE = "Video processor started. Waiting for frames..."
     frame_count = 0
     last_analysis_time = {} 
@@ -519,9 +530,10 @@ def video_processing_thread():
                 if thresh.sum() > 0:
                     last_action_frame_gray = gray;
                     
-        # --- YOLO-BASED TRACKING ---
+        # --- YOLO-BASED TRACKING (Optimized) ---
         yolo_results = yolo_model.track(
             frame, 
+            device=DEVICE, # <<< USES GPU
             persist=True, 
             classes=[0], 
             conf=current_yolo_conf, 
@@ -546,9 +558,10 @@ def video_processing_thread():
                 if "face_location" in person_registry[track_id]:
                     person_registry[track_id]["face_location"] = None
 
-            # --- STEP A: DETECT FACE LOCATIONS (RetinaFace Only) ---
+            # --- STEP A: DETECT FACE LOCATIONS (Optimized) ---
             try:
-                faces = RetinaFace.detect_faces(frame, threshold=current_retinaface_conf) 
+                # <<< USES GPU
+                faces = RetinaFace.detect_faces(frame, threshold=current_retinaface_conf, device=DEVICE) 
             except Exception as e: 
                 faces = {}
             
@@ -579,7 +592,7 @@ def video_processing_thread():
                         
                         input_face = face_crop_rgb 
 
-                        # --- GFPGAN Enhancement Step ---
+                        # --- GFPGAN Enhancement Step (Uses GPU) ---
                         if GFPGAN_AVAILABLE and current_enhancement_mode == "on" and gfpgan_enhancer is not None:
                             try:
                                 face_crop_bgr = cv2.cvtColor(face_crop_rgb, cv2.COLOR_RGB2BGR)
@@ -596,8 +609,9 @@ def video_processing_thread():
                                 pass 
                         # --- End of Enhancement Step ---
 
-                        # --- Conditional Alignment (using 'input_face') ---
+                        # --- Conditional Alignment (Uses GPU) ---
                         if SOTA_AVAILABLE:
+                            # DeepFace will auto-use GPU
                             if current_alignment_mode == "accurate":
                                 representation = DeepFace.represent(
                                     img_path=input_face, 
@@ -757,7 +771,7 @@ def toggle_action_analysis():
                 server_data["action_result"] += "\n...Live analysis stopped."
 
 def set_yolo_model(model_key):
-    global server_data, data_lock, yolo_model, LOADING_STATUS_MESSAGE
+    global server_data, data_lock, yolo_model, LOADING_STATUS_MESSAGE, DEVICE
     if model_key not in YOLO_MODELS:
         return
 
@@ -772,6 +786,7 @@ def set_yolo_model(model_key):
             def load_yolo_thread():
                 global yolo_model, server_data, LOADING_STATUS_MESSAGE
                 new_yolo = YOLO(model_path, verbose=False)
+                new_yolo.to(DEVICE) # <<< MOVES NEW MODEL TO GPU
                 yolo_model = new_yolo
                 with data_lock:
                     server_data['yolo_model_key'] = model_key
@@ -941,7 +956,7 @@ def draw_tui(stdscr):
     - "open_window"
     - "update"
     """
-    global server_data, data_lock, APP_SHOULD_QUIT
+    global server_data, data_lock, APP_SHOULD_QUIT, TUI_INFO_MESSAGE
     global SYSTEM_INITIALIZED, INITIALIZING, LOADING_STATUS_MESSAGE
     global video_thread, reader_thread, VIDEO_THREAD_STARTED, CURRENT_STREAM_SOURCE, latest_raw_frame
     
@@ -1055,14 +1070,15 @@ def draw_tui(stdscr):
             # --- 2. Draw "Idle" Screen ---
             elif not SYSTEM_INITIALIZED:
                 stdscr.addstr(0, 0, "🤖 Headless Face Comprehension", curses.color_pair(1) | curses.A_BOLD)
-                stdscr.addstr(2, 0, "System is IDLE.", curses.A_DIM)
-                stdscr.addstr(4, 0, "Press [i] to Initialize System.", curses.color_pair(2) | curses.A_BOLD)
-                stdscr.addstr(5, 0, "Press [u] to Self-Update (git pull).", curses.color_pair(2))
-                stdscr.addstr(6, 0, "Press [q] to Quit.", curses.color_pair(2))
+                stdscr.addstr(1, 0, TUI_INFO_MESSAGE, curses.A_DIM) # <<< Show device info
+                stdscr.addstr(3, 0, "System is IDLE.", curses.A_DIM)
+                stdscr.addstr(5, 0, "Press [i] to Initialize System.", curses.color_pair(2) | curses.A_BOLD)
+                stdscr.addstr(6, 0, "Press [u] to Self-Update (git pull).", curses.color_pair(2))
+                stdscr.addstr(7, 0, "Press [q] to Quit.", curses.color_pair(2))
                 
                 if LOADING_STATUS_MESSAGE and "Error" in LOADING_STATUS_MESSAGE:
-                    stdscr.addstr(8, 0, "LAST ERROR:", curses.color_pair(4) | curses.A_BOLD)
-                    stdscr.addstr(9, 0, LOADING_STATUS_MESSAGE[:max_x-1], curses.color_pair(4))
+                    stdscr.addstr(9, 0, "LAST ERROR:", curses.color_pair(4) | curses.A_BOLD)
+                    stdscr.addstr(10, 0, LOADING_STATUS_MESSAGE[:max_x-1], curses.color_pair(4))
 
             # --- 3. Draw "Running" Screen ---
             else:
@@ -1072,9 +1088,14 @@ def draw_tui(stdscr):
                 
                 # --- 3a. Header & Controls ---
                 stdscr.addstr(0, 0, "🤖 Headless Face Comprehension", curses.color_pair(1) | curses.A_BOLD)
+                
+                # <<< Show device info on main screen
+                device_str = f"({TUI_INFO_MESSAGE})"
                 controls = "[1-4] YOLO | [5] GFPGAN | [6] Align | [V]ideo Src | [S]top Analysis | [O]pen Window | [U]pdate | [Q]uit"
-                stdscr.addstr(1, 0, controls[:max_x-1])
-                stdscr.addstr(2, 0, "─" * (max_x - 1))
+                
+                stdscr.addstr(1, 0, device_str, curses.A_DIM)
+                stdscr.addstr(2, 0, controls[:max_x-1])
+                stdscr.addstr(3, 0, "─" * (max_x - 1))
 
                 # --- 3b. Status Panel ---
                 yolo_map = {'n': 'Nano', 's': 'Small', 'm': 'Medium', 'x': 'Ultra'}
@@ -1082,7 +1103,6 @@ def draw_tui(stdscr):
                 gfp_str = "ON" if local_data['face_enhancement_mode'] == 'on' else "OFF"
                 align_str = "Accurate" if local_data['face_alignment_mode'] == 'accurate' else "Fast"
                 
-                # <<< MODIFIED: Source String
                 source_str = "Pi RTSP" if CURRENT_STREAM_SOURCE == STREAM_PI_RTSP else "Webcam"
                 status_source = f" Source: {source_str} "
                 
@@ -1092,54 +1112,60 @@ def draw_tui(stdscr):
                 
                 # Draw status line
                 col = 1
-                stdscr.addstr(3, col, status_source, curses.A_REVERSE if CURRENT_STREAM_SOURCE == STREAM_PI_RTSP else curses.A_NORMAL)
+                stdscr.addstr(4, col, status_source, curses.A_REVERSE if CURRENT_STREAM_SOURCE == STREAM_PI_RTSP else curses.A_NORMAL)
                 col += len(status_source) + 1
-                stdscr.addstr(3, col, status_yolo, curses.A_REVERSE if local_data['yolo_model_key'] != 'm' else curses.A_NORMAL)
+                stdscr.addstr(4, col, status_yolo, curses.A_REVERSE if local_data['yolo_model_key'] != 'm' else curses.A_NORMAL)
                 col += len(status_yolo) + 1
-                stdscr.addstr(3, col, status_gfp, curses.A_REVERSE if local_data['face_enhancement_mode'] == 'on' else curses.A_NORMAL)
+                stdscr.addstr(4, col, status_gfp, curses.A_REVERSE if local_data['face_enhancement_mode'] == 'on' else curses.A_NORMAL)
                 col += len(status_gfp) + 1
-                stdscr.addstr(3, col, status_align, curses.A_REVERSE if local_data['face_alignment_mode'] == 'accurate' else curses.A_NORMAL)
+                stdscr.addstr(4, col, status_align, curses.A_REVERSE if local_data['face_alignment_mode'] == 'accurate' else curses.A_NORMAL)
                 
                 # --- 3c. Main Content Panels ---
                 panel_width = max_x // 2
+                panel_start_y = 6 # Moved down
                 
                 # --- Detected People Panel ---
-                stdscr.addstr(5, 0, "👤 Detected People", curses.color_pair(2) | curses.A_BOLD)
-                stdscr.addstr(6, 0, "─" * (panel_width - 2))
+                stdscr.addstr(panel_start_y, 0, "👤 Detected People", curses.color_pair(2) | curses.A_BOLD)
+                stdscr.addstr(panel_start_y + 1, 0, "─" * (panel_width - 2))
                 
                 live_faces = local_data.get('live_faces', [])
-                if not VIDEO_THREAD_STARTED:
-                    stdscr.addstr(7, 1, "Video thread is NOT running.", curses.color_pair(4))
+                
+                # <<< MODIFIED: Check thread status more reliably
+                if not VIDEO_THREAD_STARTED or not reader_thread.is_alive():
+                    stdscr.addstr(panel_start_y + 2, 1, "Video thread is NOT running.", curses.color_pair(4))
+                    if LOADING_STATUS_MESSAGE and "Error" in LOADING_STATUS_MESSAGE:
+                         stdscr.addstr(panel_start_y + 3, 1, LOADING_STATUS_MESSAGE[:panel_width-2], curses.color_pair(4))
+
                 elif not live_faces:
-                    stdscr.addstr(7, 1, "No persons detected.", curses.A_DIM)
+                    stdscr.addstr(panel_start_y + 2, 1, "No persons detected.", curses.A_DIM)
                 else:
                     for i, face in enumerate(live_faces):
-                        if 7 + i >= max_y - 2: break 
+                        if (panel_start_y + 2) + i >= max_y - 2: break 
                         name = face.get('name', 'Unknown')
                         conf = face.get('confidence', 0)
                         
                         if name == "Person":
                             display_name = "Unknown Person"
-                            stdscr.addstr(7 + i, 1, display_name, curses.color_pair(3))
+                            stdscr.addstr(panel_start_y + 2 + i, 1, display_name, curses.color_pair(3))
                         else:
                             display_name = f"{name} ({conf}%)"
-                            stdscr.addstr(7 + i, 1, display_name, curses.color_pair(2) | curses.A_BOLD)
+                            stdscr.addstr(panel_start_y + 2 + i, 1, display_name, curses.color_pair(2) | curses.A_BOLD)
 
                 # --- Action Analysis Panel ---
-                stdscr.addstr(5, panel_width, "🔳 Action Analysis", curses.color_pair(3) | curses.A_BOLD)
-                stdscr.addstr(6, panel_width, "─" * (panel_width - 1))
+                stdscr.addstr(panel_start_y, panel_width, "🔳 Action Analysis", curses.color_pair(3) | curses.A_BOLD)
+                stdscr.addstr(panel_start_y + 1, panel_width, "─" * (panel_width - 1))
                 
                 analysis_state = "RECORDING" if local_data['is_recording'] else "STOPPED"
                 analysis_color = curses.color_pair(4) | curses.A_BOLD if local_data['is_recording'] else curses.A_DIM
-                stdscr.addstr(7, panel_width + 1, f"Status: {analysis_state} (Keyframes: {local_data['keyframe_count']})", analysis_color)
+                stdscr.addstr(panel_start_y + 2, panel_width + 1, f"Status: {analysis_state} (Keyframes: {local_data['keyframe_count']})", analysis_color)
                 
                 action_result = local_data.get('action_result', "Waiting for analysis...")
                 log_lines = action_result.splitlines()
                 if not log_lines:
-                     stdscr.addstr(8, panel_width + 1, "...", curses.A_DIM)
+                     stdscr.addstr(panel_start_y + 3, panel_width + 1, "...", curses.A_DIM)
 
-                start_line_idx = max(0, len(log_lines) - (max_y - 10)) 
-                draw_y = 8
+                start_line_idx = max(0, len(log_lines) - (max_y - (panel_start_y + 4))) 
+                draw_y = panel_start_y + 3
                 for line in log_lines[start_line_idx:]:
                     if draw_y >= max_y - 1: break
                     stdscr.addstr(draw_y, panel_width + 1, line[:panel_width-2], curses.A_DIM)

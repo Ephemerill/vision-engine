@@ -9,7 +9,7 @@ import sys
 import subprocess # For self-update
 import curses # For TUI
 import base64 # Re-added for ollama calls
-import requests # For robust HTTP streaming
+# import requests # No longer needed for streaming
 from retinaface import RetinaFace
 from ultralytics import YOLO
 
@@ -47,9 +47,17 @@ MODEL_OFF = 'off'
 
 # --- Video Source Configuration ---
 STREAM_WEBCAM = 0 # Default built-in webcam
-STREAM_PI_GSTREAMER = "http://127.0.0.1:8080" # From receiver.sh
-STREAM_BOUNDARY = b'--boundary' # From your receiver.sh
-# ---------------------------------------
+
+# <<< --- MODIFIED FOR RTSP STREAM --- >>>
+# SET YOUR PI'S TAILSCALE IP HERE
+STREAM_PI_TAILSCALE_IP = "100.114.210.58" 
+
+# This builds the RTSP URL your Python script will read
+STREAM_PI_RTSP = f"rtsp://{STREAM_PI_TAILSCALE_IP}:8554/cam"
+
+# REMOVED: STREAM_PI_GSTREAMER = "http://127.0.0.1:8080"
+# REMOVED: STREAM_BOUNDARY = b'--boundary'
+# <<< ---------------------------------- >>>
 
 FRAME_WIDTH = 640
 FRAME_HEIGHT = 480
@@ -409,34 +417,29 @@ def video_processing_thread(source):
     global DeepFace, dst, SOTA_AVAILABLE, GFPGAN_AVAILABLE # Need these
     global LOADING_STATUS_MESSAGE, VIDEO_THREAD_STARTED # Use global for error reporting
     
-    # --- MODIFIED: This thread now handles TWO capture methods ---
+    # --- MODIFIED: Unified Video Capture ---
+    # Both webcam (0) and RTSP URLs are handled by cv2.VideoCapture
     
     cap = None
-    frame_iter = None # For requests stream
     
-    if source == STREAM_PI_GSTREAMER:
-        # --- METHOD 1: Use Requests for HTTP Stream ---
-        try:
-            LOADING_STATUS_MESSAGE = "Connecting to HTTP stream..."
-            r = requests.get(source, stream=True, timeout=5.0)
-            r.raise_for_status() # Fail fast if we get 404, etc.
-            
-            LOADING_STATUS_MESSAGE = "Stream connected. Reading bytes..."
-            frame_iter = r.iter_content(chunk_size=1024*10) # 10KB chunks
-            
-        except requests.exceptions.RequestException as e:
-            LOADING_STATUS_MESSAGE = f"Error: Failed to connect. Is receiver.sh running?"
-            VIDEO_THREAD_STARTED = False
-            return
-    else:
-        # --- METHOD 2: Use cv2.VideoCapture for Webcam ---
-        LOADING_STATUS_MESSAGE = "Opening webcam..."
+    try:
+        LOADING_STATUS_MESSAGE = f"Opening video source: {source}"
+        # This one function handles local device numbers OR network URLs
         cap = cv2.VideoCapture(source)
-        if not cap.isOpened():
-            LOADING_STATUS_MESSAGE = f"Error: Could not open webcam {source}."
-            VIDEO_THREAD_STARTED = False
-            return
+        
+        # Set a small buffer. This is crucial for low-latency on RTSP
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
+    except Exception as e:
+        LOADING_STATUS_MESSAGE = f"Error opening source: {e}"
+        VIDEO_THREAD_STARTED = False
+        return
+
+    if not cap.isOpened():
+        LOADING_STATUS_MESSAGE = f"Error: Could not open video source {source}."
+        VIDEO_THREAD_STARTED = False
+        return
+    
     # --- If we get here, connection was successful ---
     LOADING_STATUS_MESSAGE = "Video source connected and open. Reading frames..."
     time.sleep(1.0)
@@ -445,77 +448,33 @@ def video_processing_thread(source):
     frame_count = 0
     last_analysis_time = {} 
     
-    # Variables for HTTP stream parsing
-    byte_buffer = b''
-    
+    # REMOVED: byte_buffer and multipart parsing logic
+
     while not APP_SHOULD_QUIT:
         
         frame = None # Frame to be processed
         
-        # --- Get Frame Logic ---
-        if cap:
-            # --- Webcam Logic ---
+        # --- Get Frame Logic (Unified) ---
+        try:
             ret, frame = cap.read()
             if not ret:
-                LOADING_STATUS_MESSAGE = "Error: Cannot read from webcam."
+                LOADING_STATUS_MESSAGE = "Error: Cannot read frame from stream. Reconnecting..."
+                # Attempt to reopen the stream if it fails
+                cap.release()
+                cap = cv2.VideoCapture(source)
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                 time.sleep(0.5)
                 continue
-        
-        elif frame_iter:
-            # --- HTTP Stream Logic (Robust Multipart Parser) ---
-            try:
-                chunk = next(frame_iter) # Get next chunk from stream
-                if not chunk:
-                    continue
                 
-                byte_buffer += chunk
-                
-                # Find start and end of a multipart frame
-                start = byte_buffer.find(STREAM_BOUNDARY)
-                end = byte_buffer.find(STREAM_BOUNDARY, start + len(STREAM_BOUNDARY))
-                
-                if start != -1 and end != -1:
-                    # We have a full part (header + JPEG)
-                    part = byte_buffer[start:end]
-                    byte_buffer = byte_buffer[end:] # Keep the rest for next loop
-                    
-                    # --- NEW ROBUST PARSING ---
-                    # Find the start and end of the JPEG *within* this part
-                    jpg_start = part.find(b'\xff\xd8')
-                    jpg_end = part.rfind(b'\xff\xd9', jpg_start) # Find LAST end *after* start
-                    
-                    if jpg_start != -1 and jpg_end != -1:
-                        # We have a complete, valid JPEG
-                        jpg = part[jpg_start:jpg_end + 2] # Slice *exactly*
-                        
-                        # Decode the JPEG bytes into an OpenCV frame
-                        frame = cv2.imdecode(np.frombuffer(jpg, dtype=np.uint8), cv2.IMREAD_COLOR)
-                        
-                        if frame is None:
-                            LOADING_STATUS_MESSAGE = "Failed to decode JPEG from stream."
-                            continue # Skip this corrupt frame
-                    # --- END OF NEW PARSING ---
-                    else:
-                        # We got a part, but no valid JPEG found inside
-                        continue
-                        
-            except requests.exceptions.ChunkedEncodingError:
-                LOADING_STATUS_MESSAGE = "Stream disconnected (ChunkedEncodingError)."
-                VIDEO_THREAD_STARTED = False
-                break # Exit thread
-            except StopIteration:
-                LOADING_STATUS_MESSAGE = "Stream ended (StopIteration)."
-                VIDEO_THREAD_STARTED = False
-                break # Exit thread
-            except Exception as e:
-                LOADING_STATUS_MESSAGE = f"Stream read error: {e}"
-                time.sleep(0.1)
-                continue
+        except Exception as e:
+            LOADING_STATUS_MESSAGE = f"Stream read error: {e}"
+            time.sleep(0.1)
+            continue
         
         # --- End of Get Frame Logic ---
 
         if frame is None:
-            # If frame is still None (e.g., waiting for first full JPEG)
+            # If frame is still None
             time.sleep(0.01)
             continue
             
@@ -754,9 +713,6 @@ def video_processing_thread(source):
     # --- End of thread loop ---
     if cap:
         cap.release()
-    if frame_iter:
-        # This will properly close the requests connection
-        frame_iter.close()
         
     cv2.destroyAllWindows()
     VIDEO_THREAD_STARTED = False # Mark as stopped
@@ -1028,7 +984,7 @@ def draw_tui(stdscr):
                     
                     # Toggle the source
                     if CURRENT_STREAM_SOURCE == STREAM_WEBCAM:
-                        CURRENT_STREAM_SOURCE = STREAM_PI_GSTREAMER
+                        CURRENT_STREAM_SOURCE = STREAM_PI_RTSP # <<< MODIFIED
                     else:
                         CURRENT_STREAM_SOURCE = STREAM_WEBCAM
                     
@@ -1096,8 +1052,8 @@ def draw_tui(stdscr):
                 gfp_str = "ON" if local_data['face_enhancement_mode'] == 'on' else "OFF"
                 align_str = "Accurate" if local_data['face_alignment_mode'] == 'accurate' else "Fast"
                 
-                # <<< NEW: Source String
-                source_str = "Pi Stream" if CURRENT_STREAM_SOURCE == STREAM_PI_GSTREAMER else "Webcam"
+                # <<< MODIFIED: Source String
+                source_str = "Pi RTSP" if CURRENT_STREAM_SOURCE == STREAM_PI_RTSP else "Webcam"
                 status_source = f" Source: {source_str} "
                 
                 status_yolo = f" YOLO: {yolo_str} "
@@ -1106,7 +1062,7 @@ def draw_tui(stdscr):
                 
                 # Draw status line
                 col = 1
-                stdscr.addstr(3, col, status_source, curses.A_REVERSE if CURRENT_STREAM_SOURCE == STREAM_PI_GSTREAMER else curses.A_NORMAL)
+                stdscr.addstr(3, col, status_source, curses.A_REVERSE if CURRENT_STREAM_SOURCE == STREAM_PI_RTSP else curses.A_NORMAL)
                 col += len(status_source) + 1
                 stdscr.addstr(3, col, status_yolo, curses.A_REVERSE if local_data['yolo_model_key'] != 'm' else curses.A_NORMAL)
                 col += len(status_yolo) + 1

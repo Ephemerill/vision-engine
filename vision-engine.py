@@ -52,7 +52,11 @@ MODEL_OFF = 'off'
 
 # --- Video Source Configuration ---
 STREAM_WEBCAM = 0 # Default built-in webcam
-STREAM_PI_TAILSCALE_IP = "100.114.20.58" # SET YOUR PI'S TAILSCALE IP HERE
+
+# --- <<< IP ADDRESS FIX >>> ---
+# This was the most likely cause of the 30-second timeout.
+# Please double-check this is your Pi's correct Tailscale IP.
+STREAM_PI_TAILSCALE_IP = "100.114.210.58" 
 STREAM_PI_RTSP = f"rtsp://{STREAM_PI_TAILSCALE_IP}:8554/cam"
 
 FRAME_WIDTH = 640
@@ -522,6 +526,9 @@ def video_processing_thread():
         frame = None
         with data_lock:
             if latest_raw_frame is None:
+                # This will be true if the reader thread failed to start
+                if VIDEO_THREAD_STARTED == False and INITIALIZING == False:
+                    LOADING_STATUS_MESSAGE = "Error: No video source. Reader thread is not running."
                 time.sleep(0.1); continue
             frame = latest_raw_frame.copy()
             
@@ -784,22 +791,21 @@ def threaded_system_init():
     VIDEO_THREAD_STARTED = False
     
     try:
-        load_resources() # This populates LOADING_STATUS_MESSAGE
-        SYSTEM_INITIALIZED = True
-        LOADING_STATUS_MESSAGE = "System Initialized. Starting video threads..."
-        time.sleep(1.0)
-        
+        # --- <<< MODIFIED: Start video threads *before* loading models >>> ---
+        LOADING_STATUS_MESSAGE = "Attempting to connect to video stream..."
         latest_raw_frame = None 
 
-        # 1. Start the Reader (Producer)
         reader_thread = threading.Thread(target=_frame_reader_loop, args=(CURRENT_STREAM_SOURCE,), daemon=True)
         reader_thread.start()
 
-        # 2. Start the Processor (Consumer)
         video_thread = threading.Thread(target=video_processing_thread, args=(), daemon=True)
         video_thread.start()
-        
         # VIDEO_THREAD_STARTED is now set by the reader_thread itself
+        
+        # --- Now, load resources in parallel while stream connects ---
+        load_resources() # This will block, but the stream is connecting in the background
+        
+        SYSTEM_INITIALIZED = True
         
         if not LOADING_STATUS_MESSAGE or "Connecting" not in LOADING_STATUS_MESSAGE:
             LOADING_STATUS_MESSAGE = "System Running."

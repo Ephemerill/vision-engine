@@ -1,3 +1,4 @@
+vision-engine.py
 import cv2
 import face_recognition 
 import os
@@ -8,37 +9,45 @@ import time
 import sys
 import subprocess 
 import curses 
-import base64 
-from retinaface import RetinaFace
-from ultralytics import YOLO
+import base64
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 import torch
 
+# --- NEW: Web Server ---
+from flask import Flask, Response
+
 # --- CONFIGURATION (USER EDITABLE) ---
 # ---------------------------------------------------------
-# FACE RECOGNITION SENSITIVITY
-# 0.6 = Standard (Can be loose)
-# 0.5 = Stricter (Recommended for false positives)
-# 0.4 = Very Strict (Might miss faces at angles)
+# 0.5 is recommended for stricter matching to reduce false positives
 RECOGNITION_TOLERANCE = 0.5 
+WEB_SERVER_PORT = 5000
 # ---------------------------------------------------------
 
 # --- DEVICE CONFIGURATION --- 
+# Force CUDA for the Nvidia P100
 DEVICE_STR = 'cuda:0' if torch.cuda.is_available() else 'cpu'
-if torch.backends.mps.is_available():
-    DEVICE_STR = 'mps' 
-TUI_INFO_MESSAGE = f"Using Device (YOLO/Torch): {DEVICE_STR}"
+TUI_INFO_MESSAGE = f"Hardware: {DEVICE_STR} (P100 Optimization Active)"
 
 # --- SOTA IMPORTS ---
 try:
     import deepface
     import gfpgan
-    SOTA_AVAILABLE_PRECHECK = True
-    GFPGAN_AVAILABLE_PRECHECK = True
+    from deepface import DeepFace
+    # We prioritize ArcFace on the P100 because it uses GPU acceleration
+    # better than standard dlib (unless dlib is manually compiled with CUDA)
+    SOTA_AVAILABLE = True
+    GFPGAN_AVAILABLE = True
 except ImportError:
-    SOTA_AVAILABLE_PRECHECK = False
-    GFPGAN_AVAILABLE_PRECHECK = False
+    SOTA_AVAILABLE = False
+    GFPGAN_AVAILABLE = False
+
+# --- FLASK APP ---
+app = Flask(__name__)
+# Disable Flask logging to keep TUI clean
+import logging
+log = logging.getLogger('werkzeug')
+log.setLevel(logging.ERROR)
 
 # --- STATUS & LOGGING ---
 LOADING_STATUS_MESSAGE = ""
@@ -67,7 +76,7 @@ BOX_PADDING = 10
 
 # --- ML THRESHOLDS ---
 RETINAFACE_CONFIDENCE = 0.5 
-FACE_RECOGNITION_NTH_FRAME = 5 
+FACE_RECOGNITION_NTH_FRAME = 4 # Lowered slightly since P100 is fast
 
 # --- COLORS ---
 COLOR_BODY_KNOWN = (255, 100, 100) 
@@ -77,6 +86,7 @@ COLOR_TEXT_BG = (0, 0, 0)
 COLOR_TEXT_FG = (255, 255, 255)
 
 # --- YOLO MODELS ---
+from ultralytics import YOLO
 YOLO_MODELS = {"n": "yolo11n.pt", "s": "yolo11s.pt", "m": "yolo11m.pt"}
 
 # --- GLOBAL STATE ---
@@ -92,11 +102,11 @@ CURRENT_STREAM_SOURCE = STREAM_PI_RTSP
 server_data = {
     "is_recording": False, "keyframe_count": 0, "action_result": "", "live_faces": [],
     "model": MODEL_GEMMA, 
-    "yolo_model_key": "m", # Default
+    "yolo_model_key": "m", # Default to Medium for P100 (it can handle it)
     "yolo_conf": 0.4, 
     "face_enhancement_mode": "off" 
 }
-if not GFPGAN_AVAILABLE_PRECHECK:
+if not GFPGAN:
     server_data["face_enhancement_mode"] = "off_disabled"
 
 # --- RESOURCES ---
@@ -105,9 +115,8 @@ known_face_names = []
 person_registry = {} 
 last_face_locations = [] 
 
-DeepFace = None; dst = None; GFPGANer = None
+dst = None; GFPGANer = None
 yolo_model = None; gfpgan_enhancer = None
-SOTA_AVAILABLE = False; GFPGAN_AVAILABLE = False
 
 # --- HELPER FUNCTIONS ---
 def resize_with_aspect_ratio(frame, max_w=640, max_h=480):
@@ -119,7 +128,7 @@ def resize_with_aspect_ratio(frame, max_w=640, max_h=480):
     return cv2.resize(frame, (int(w * r), int(h * r)), interpolation=cv2.INTER_AREA)
 
 def load_known_faces(known_faces_dir):
-    global known_face_encodings, known_face_names, DeepFace, SOTA_AVAILABLE
+    global known_face_encodings, known_face_names
     if not os.path.exists(known_faces_dir): return
     
     known_face_encodings.clear(); known_face_names.clear()
@@ -144,6 +153,32 @@ def get_containing_body_box(face_box, body_boxes):
         if bl < cx < br and bt < cy < bb: return track_id
     return None
 
+# --- FLASK ROUTES ---
+@app.route('/')
+def index():
+    return "<html><body><h1>Vision Engine Live View</h1><img src='/video_feed' style='width:100%; max-width:800px;'></body></html>"
+
+def generate_frames():
+    while True:
+        with data_lock:
+            if output_frame is None:
+                time.sleep(0.1); continue
+            # Encode frame to JPG
+            (flag, encodedImage) = cv2.imencode(".jpg", output_frame)
+            if not flag: continue
+        
+        # Yield the output frame in byte format
+        yield(b'--frame\r\n' b'Content-Type: image/jpeg\r\n\r\n' + 
+              bytearray(encodedImage) + b'\r\n')
+
+@app.route('/video_feed')
+def video_feed():
+    return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+def run_flask():
+    # Run Flask on 0.0.0.0 to be accessible via Tailscale IP
+    app.run(host='0.0.0.0', port=WEB_SERVER_PORT, debug=False, use_reloader=False)
+
 # --- CONTROL FUNCTIONS ---
 def set_yolo_model(model_key):
     global server_data, data_lock, yolo_model, LOADING_STATUS_MESSAGE
@@ -155,8 +190,7 @@ def set_yolo_model(model_key):
         with data_lock: LOADING_STATUS_MESSAGE = f"Switching YOLO to {model_key}..."
         try:
             new_model = YOLO(YOLO_MODELS[model_key], verbose=False)
-            new_model.to('cpu') 
-            # Atomic swap
+            new_model.to(DEVICE_STR) 
             yolo_model = new_model
             with data_lock: 
                 server_data['yolo_model_key'] = model_key
@@ -178,23 +212,27 @@ def toggle_gfpgan():
 def _load_resources():
     global DeepFace, dst, GFPGANer, SOTA_AVAILABLE, GFPGAN_AVAILABLE, yolo_model, gfpgan_enhancer
     
-    print_progress_bar(1, 5, "Importing DeepFace...")
+    # 1. DeepFace (ArcFace) - Optimized for GPU
+    print_progress_bar(1, 5, "Importing DeepFace (ArcFace)...")
     try:
-        from deepface import DeepFace as DF; DeepFace = DF
-        from deepface.modules import verification as ver; dst = ver
+        # We load ArcFace by default for better GPU perf
+        DeepFace.build_model("ArcFace")
         SOTA_AVAILABLE = True
     except: SOTA_AVAILABLE = False
 
+    # 2. GFPGAN
     print_progress_bar(2, 5, "Importing GFPGAN...")
     try:
         from gfpgan import GFPGANer as G; GFPGANer = G
         GFPGAN_AVAILABLE = True
     except: GFPGAN_AVAILABLE = False
 
+    # 3. YOLO
     print_progress_bar(3, 5, "Loading YOLO...")
     yolo_model = YOLO(YOLO_MODELS[server_data['yolo_model_key']], verbose=False)
-    yolo_model.to('cpu') 
+    yolo_model.to(DEVICE_STR) # Explicitly send to P100
 
+    # 4. GFPGAN Model
     print_progress_bar(4, 5, "Loading Enhancer...")
     if GFPGAN_AVAILABLE:
         try:
@@ -202,6 +240,7 @@ def _load_resources():
         except: 
             with data_lock: server_data["face_enhancement_mode"] = "off_disabled"
 
+    # 5. Faces
     print_progress_bar(5, 5, "Loading Faces...")
     load_known_faces(KNOWN_FACES_DIR)
 
@@ -211,6 +250,7 @@ def _frame_reader_loop(source):
     cap = None
     
     def connect(src):
+        # Linux/Server optimization: CAP_FFMPEG is strictly required
         if isinstance(src, int): return cv2.VideoCapture(src)
         return cv2.VideoCapture(src, cv2.CAP_FFMPEG) 
 
@@ -233,16 +273,22 @@ def video_processing_thread():
     global data_lock, output_frame, server_data, APP_SHOULD_QUIT, latest_raw_frame
     global person_registry, last_face_locations, LOADING_STATUS_MESSAGE
     
+    from retinaface import RetinaFace # Import here to ensure context
     frame_count = 0
+    
+    # Thread pool for dual Xeons (lots of threads!)
+    # Even though ML is on GPU, CPU handles frame decoding/resizing/OS logic
+    executor = ThreadPoolExecutor(max_workers=8) 
+
     while INITIALIZING and not APP_SHOULD_QUIT: time.sleep(0.1)
 
     while not APP_SHOULD_QUIT:
         frame = None
         with data_lock:
             if latest_raw_frame is not None: frame = latest_raw_frame.copy()
-        if frame is None: time.sleep(0.05); continue
+        if frame is None: time.sleep(0.02); continue
 
-        frame = cv2.flip(frame, 1)
+        # Resize (CPU bound, uses Xeon)
         frame = resize_with_aspect_ratio(frame, max_w=FRAME_WIDTH, max_h=FRAME_HEIGHT)
         if frame is None: continue
         frame_count += 1
@@ -252,7 +298,7 @@ def video_processing_thread():
             enhancement_mode = server_data["face_enhancement_mode"]
             yolo_conf = server_data["yolo_conf"]
 
-        # 1. YOLO Tracking
+        # 1. YOLO Tracking (GPU P100)
         yolo_results = yolo_model.track(frame, persist=True, classes=[0], conf=yolo_conf, verbose=False)
         body_boxes = {}; active_track_ids = []
         if yolo_results[0].boxes.id is not None:
@@ -265,10 +311,11 @@ def video_processing_thread():
                 if track_id not in person_registry:
                     person_registry[track_id] = {"name": "Unknown", "conf": 0.0, "last_seen": time.time()}
 
-        # 2. RetinaFace Detection
+        # 2. RetinaFace Detection (GPU P100)
         if frame_count % FACE_RECOGNITION_NTH_FRAME == 0:
             detected_faces = {}
-            try: detected_faces = RetinaFace.detect_faces(frame, threshold=RETINAFACE_CONFIDENCE)
+            try: 
+                detected_faces = RetinaFace.detect_faces(frame, threshold=RETINAFACE_CONFIDENCE)
             except Exception as e: 
                 with data_lock: LOADING_STATUS_MESSAGE = f"RetinaFace Error: {e}"
 
@@ -285,14 +332,12 @@ def video_processing_thread():
             for face_loc in current_face_locations:
                 body_id = get_containing_body_box(face_loc, body_boxes)
                 if body_id is not None:
-                    # Crop
                     top, right, bottom, left = face_loc
                     
-                    # --- GFPGAN ENHANCEMENT START ---
+                    # --- GFPGAN ENHANCEMENT (GPU P100) ---
                     input_image_encoding = rgb_frame_for_encoding
                     
                     if GFPGAN_AVAILABLE and enhancement_mode == "on" and gfpgan_enhancer:
-                         # Crop face strictly for enhancement
                          t_pad = max(0, top - BOX_PADDING); b_pad = min(frame.shape[0], bottom + BOX_PADDING)
                          l_pad = max(0, left - BOX_PADDING); r_pad = min(frame.shape[1], right + BOX_PADDING)
                          face_crop_bgr = frame[t_pad:b_pad, l_pad:r_pad]
@@ -305,11 +350,14 @@ def video_processing_thread():
                                  input_image_encoding = cv2.cvtColor(restored_face, cv2.COLOR_BGR2RGB)
                                  encoding_loc = [(0, input_image_encoding.shape[1], input_image_encoding.shape[0], 0)]
                          except:
-                             encoding_loc = [face_loc] # Fallback
+                             encoding_loc = [face_loc] 
                     else:
                         encoding_loc = [face_loc]
-                    # --- GFPGAN ENHANCEMENT END ---
 
+                    # --- RECOGNITION ---
+                    # Note: Dlib (face_recognition) is CPU bound unless compiled with CUDA.
+                    # ArcFace (DeepFace) is recommended for P100 but requires changing this logic block.
+                    # Sticking to user's preferred logic for now, relying on Dlib CUDA if installed.
                     face_enc = face_recognition.face_encodings(input_image_encoding, encoding_loc)
                     
                     name = "Unknown"; conf = 0.0
@@ -350,36 +398,6 @@ def video_processing_thread():
             output_frame = frame
             server_data["live_faces"] = live_face_payload
 
-# --- GUI / WINDOW MODE ---
-def run_cv2_window_mode():
-    """ Opens a desktop window for debugging with crash protection """
-    global APP_SHOULD_QUIT
-    print("Opening Debug Window... Press 'q' inside window to close.")
-    window_name = "Debug Feed"
-    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-    
-    while not APP_SHOULD_QUIT:
-        frame_to_show = None
-        with data_lock:
-            if output_frame is not None:
-                frame_to_show = output_frame.copy()
-        
-        if frame_to_show is not None:
-            cv2.imshow(window_name, frame_to_show)
-        else:
-            cv2.imshow(window_name, np.zeros((480, 640, 3), dtype=np.uint8))
-
-        try:
-            if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1: break
-        except: pass 
-
-        key = cv2.waitKey(30) & 0xFF
-        if key == ord('q'): break
-    
-    cv2.destroyAllWindows()
-    cv2.waitKey(1) 
-    return "tui" 
-
 # --- MAIN / TUI ---
 def threaded_init():
     global INITIALIZING, SYSTEM_INITIALIZED
@@ -388,6 +406,11 @@ def threaded_init():
         reader = threading.Thread(target=_frame_reader_loop, args=(CURRENT_STREAM_SOURCE,), daemon=True); reader.start()
         _load_resources()
         proc = threading.Thread(target=video_processing_thread, daemon=True); proc.start()
+        
+        # Start Flask Server
+        flask_thread = threading.Thread(target=run_flask, daemon=True)
+        flask_thread.start()
+        
         SYSTEM_INITIALIZED = True
     except Exception as e:
         global LOADING_STATUS_MESSAGE
@@ -405,7 +428,6 @@ def draw_tui(stdscr):
         if k == ord('q'): APP_SHOULD_QUIT = True; return "quit"
         elif k == ord('i') and not SYSTEM_INITIALIZED and not INITIALIZING:
             threading.Thread(target=threaded_init, daemon=True).start()
-        elif k == ord('o') and SYSTEM_INITIALIZED: return "open_window"
         elif k == ord('1'): set_yolo_model('n')
         elif k == ord('2'): set_yolo_model('s')
         elif k == ord('3'): set_yolo_model('m')
@@ -422,12 +444,13 @@ def draw_tui(stdscr):
             
             stdscr.addstr(0, 0, "Vision Engine (RUNNING)", curses.color_pair(1))
             stdscr.addstr(1, 0, f"Source: {CURRENT_STREAM_SOURCE}")
-            stdscr.addstr(2, 0, f"YOLO: {ym} (1-3) | GFPGAN: {gm} (5) | [o] Window | [q] Quit")
+            stdscr.addstr(2, 0, f"YOLO: {ym} | GFP: {gm} | [q] Quit")
+            stdscr.addstr(3, 0, f"WEB VIEW: http://0.0.0.0:{WEB_SERVER_PORT}/")
             
             with data_lock: faces = server_data["live_faces"]
-            stdscr.addstr(4, 0, "--- TRACKED PEOPLE ---")
+            stdscr.addstr(5, 0, "--- TRACKED PEOPLE ---")
             for i, f in enumerate(faces):
-                stdscr.addstr(5+i, 0, f"> {f['name']} ({int(f['confidence'])}%)")
+                stdscr.addstr(6+i, 0, f"> {f['name']} ({int(f['confidence'])}%)")
             
             if LOADING_STATUS_MESSAGE:
                 stdscr.addstr(10, 0, f"Log: {LOADING_STATUS_MESSAGE}")
@@ -436,11 +459,8 @@ def draw_tui(stdscr):
     return "quit"
 
 if __name__ == "__main__":
-    next_action = "tui"
     try:
-        while next_action != "quit":
-            if next_action == "tui": next_action = curses.wrapper(draw_tui)
-            elif next_action == "open_window": next_action = run_cv2_window_mode()
+        curses.wrapper(draw_tui)
     except KeyboardInterrupt: pass
     finally:
         APP_SHOULD_QUIT = True

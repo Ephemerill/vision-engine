@@ -1,0 +1,19 @@
+# Core ML/CV
+opencv-python-headless
+ultralytics
+deepface
+retina-face
+tf-keras
+requests
+flask
+
+# Math/Data
+numpy
+pandas
+
+# GFPGAN
+gfpgan
+git+https://github.com/XPixelGroup/BasicSR.git
+
+# AI
+ollama

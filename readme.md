@@ -1,5 +1,10 @@
-make a python 3.11 venv
+This kind of works
+
+steps to get this running:
+
+install the requirements.txt file
+
+then install cuda specific packages
 ```
-python3.11 -m venv venv
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121 --force-reinstall
 ```
-this is fickle

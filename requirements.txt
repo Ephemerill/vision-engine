@@ -1,16 +1,14 @@
 # Core ML/CV
-opencv-python
+opencv-python-headless
 ultralytics
 deepface
 retina-face
-face-recognition
-numpy
 tf-keras
 requests
-
-# GFPGAN & Dependencies
+flask
+numpy
+pandas
 gfpgan
 git+https://github.com/XPixelGroup/BasicSR.git
-
-# AI/LLM
 ollama
+face_recognition

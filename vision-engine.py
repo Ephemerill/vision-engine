@@ -7,7 +7,6 @@ import cv2
 import face_recognition 
 import os
 import numpy as np
-import ollama
 import threading
 import time
 import sys
@@ -25,6 +24,7 @@ from ultralytics import YOLO
 # --- CONFIGURATION ---
 RECOGNITION_TOLERANCE = 0.5 
 WEB_SERVER_PORT = 5005
+BOX_PADDING = 40  # Added missing variable to prevent crash during enhancement
 
 # --- YOLO FACE CONFIG ---
 FACE_MODEL_NAME = "yolov11n-face.pt"
@@ -49,6 +49,7 @@ try:
     GFPGAN_AVAILABLE = True
 except ImportError:
     GFPGAN_AVAILABLE = False
+    logger.warning("⚠️  GFPGAN library not found. Enhancement will be disabled.")
 
 # --- FLASK APP ---
 app = Flask(__name__)
@@ -91,7 +92,7 @@ server_data = {
     "model": MODEL_GEMMA, 
     "yolo_model_key": "l", 
     "yolo_conf": 0.4, 
-    "face_enhancement_mode": "off" 
+    "face_enhancement_mode": "on"  # Changed from 'off' to 'on'
 }
 
 if not GFPGAN_AVAILABLE:
@@ -254,7 +255,9 @@ def _load_resources():
     try:
         from gfpgan import GFPGANer as G; GFPGANer = G
         GFPGAN_AVAILABLE = True
-    except: GFPGAN_AVAILABLE = False
+    except: 
+        logger.error("Could not load GFPGANer class.")
+        GFPGAN_AVAILABLE = False
 
     logger.info("Loading YOLO11 Body Model (GPU)...")
     yolo_body_model = YOLO(YOLO_MODELS[server_data['yolo_model_key']], verbose=False)
@@ -272,7 +275,8 @@ def _load_resources():
         logger.info("Loading GFPGAN Weights...")
         try:
             gfpgan_enhancer = GFPGANer(model_path='https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.3.pth', upscale=2, arch='clean', channel_multiplier=2, bg_upsampler=None, device=DEVICE_STR)
-        except: 
+        except Exception as e: 
+            logger.error(f"Failed to init GFPGAN: {e}")
             with data_lock: server_data["face_enhancement_mode"] = "off_disabled"
 
     load_known_faces(KNOWN_FACES_DIR)
@@ -376,7 +380,10 @@ def video_processing_thread():
                              if restored_face is not None:
                                  input_image_encoding = cv2.cvtColor(restored_face, cv2.COLOR_BGR2RGB)
                                  encoding_loc = [(0, input_image_encoding.shape[1], input_image_encoding.shape[0], 0)]
-                         except:
+                             else:
+                                 encoding_loc = [face_loc]
+                         except Exception as e:
+                             logger.error(f"Enhancement error: {e}")
                              encoding_loc = [face_loc] 
                     else:
                         encoding_loc = [face_loc]

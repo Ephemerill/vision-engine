@@ -1,13 +1,16 @@
 import os
-# --- CRITICAL: GPU MEMORY MANAGEMENT ---
-# Allow TensorFlow (DeepFace) to grow memory dynamically so it doesn't crash YOLO
+import warnings
+
+# --- GPU MEMORY SETTINGS (Must be first) ---
 os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
-import warnings
-warnings.filterwarnings("ignore")
+# Silence specific library warnings
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 import cv2
+import face_recognition 
 import numpy as np
 import ollama
 import threading
@@ -25,17 +28,10 @@ from flask import Flask, Response
 from ultralytics import YOLO
 
 # --- CONFIGURATION ---
+RECOGNITION_TOLERANCE = 0.5 
 WEB_SERVER_PORT = 5005
 
-# --- ARCFACE CONFIGURATION ---
-# ArcFace uses Cosine Distance. 
-# Lower number = Stricter Match.
-# 0.4 is very strict, 0.68 is standard. 
-# For "Far Away" recognition, 0.65 is usually a good sweet spot.
-ARCFACE_THRESHOLD = 0.65
-
 # --- YOLO FACE CONFIG ---
-# We use the Nano model for speed on the 2060S
 FACE_MODEL_NAME = "yolov11n-face.pt"
 FACE_MODEL_URL = f"https://github.com/YapaLab/yolo-face/releases/download/v0.0.0/{FACE_MODEL_NAME}"
 
@@ -59,12 +55,11 @@ try:
 except ImportError:
     GFPGAN_AVAILABLE = False
 
-# Import DeepFace for ArcFace model
 try:
     from deepface import DeepFace
     DEEPFACE_AVAILABLE = True
 except ImportError:
-    logger.error("DeepFace not found. Please install: pip install deepface tf-keras")
+    logger.error("DeepFace not found. pip install deepface tf-keras")
     DEEPFACE_AVAILABLE = False
 
 # --- FLASK APP ---
@@ -92,7 +87,7 @@ COLOR_BODY_UNKNOWN = (100, 100, 255)
 COLOR_FACE_BOX = (255, 255, 0) 
 COLOR_TEXT_FG = (255, 255, 255)
 
-# Default Body Models
+# Standard YOLO models (for Body)
 YOLO_MODELS = {"n": "yolo11n.pt", "s": "yolo11s.pt", "m": "yolo11m.pt", "l": "yolo11l.pt"}
 
 # --- GLOBAL STATE ---
@@ -106,16 +101,15 @@ CURRENT_STREAM_SOURCE = STREAM_PI_RTSP
 server_data = {
     "is_recording": False, "keyframe_count": 0, "action_result": "", "live_faces": [],
     "model": MODEL_GEMMA, 
-    "yolo_model_key": "l", 
+    "yolo_model_key": "l", # Defaulting to Large for better accuracy
     "yolo_conf": 0.4, 
-    "face_enhancement_mode": "on" # Default ON for far-away faces
+    "face_enhancement_mode": "on" 
 }
 
 if not GFPGAN_AVAILABLE:
     server_data["face_enhancement_mode"] = "off_disabled"
 
 # --- RESOURCES ---
-# Store as {name: [embedding_vector_1, embedding_vector_2]}
 known_face_db = {} 
 person_registry = {} 
 last_face_locations = [] 
@@ -167,23 +161,25 @@ def load_known_faces(known_faces_dir):
             if filename.lower().endswith((".jpg", ".png", ".jpeg")):
                 image_path = os.path.join(person_dir, filename)
                 try:
-                    # Generate ArcFace Embedding
+                    # UPDATED: Use 'opencv' backend to find the face in the reference photo.
+                    # 'skip' was causing issues if the reference image wasn't already cropped.
                     embedding_objs = DeepFace.represent(
                         img_path=image_path,
                         model_name="ArcFace",
-                        enforce_detection=False,
-                        detector_backend="skip"
+                        enforce_detection=True, 
+                        detector_backend="opencv" 
                     )
                     if embedding_objs:
                         embedding = embedding_objs[0]["embedding"]
                         known_face_db[person_name].append(embedding)
                         count += 1
-                except: pass
+                except Exception as e:
+                    # Print exact error to debug "0 vectors" issue
+                    logger.warning(f"Failed to load {filename}: {e}")
                 
     logger.info(f"Loaded {count} face vectors for {len(known_face_db)} people.")
 
 def calculate_iou(boxA, boxB):
-    # Convert to x1, y1, x2, y2
     f_x1, f_y1, f_x2, f_y2 = boxA[3], boxA[0], boxA[1], boxA[2]
     b_x1, b_y1, b_x2, b_y2 = boxB[3], boxB[0], boxB[1], boxB[2]
 
@@ -209,16 +205,13 @@ def get_best_matching_body(face_box, body_boxes):
     return best_id
 
 def find_best_match_arcface(target_embedding):
-    """
-    Compares target embedding against the known database using Cosine Distance.
-    Returns: (Name, Distance)
-    """
     best_name = "Unknown"
-    best_distance = 1.0 # 1.0 is max distance (no match)
+    best_distance = 1.0
+    # ArcFace Threshold: 0.65 is a good balance for distance
+    ARCFACE_THRESHOLD = 0.65
     
     for name, embeddings_list in known_face_db.items():
         for known_emb in embeddings_list:
-            # Cosine Distance Formula
             try:
                 a = np.array(target_embedding)
                 b = np.array(known_emb)
@@ -273,7 +266,7 @@ def _load_resources():
         GFPGAN_AVAILABLE = True
     except: GFPGAN_AVAILABLE = False
 
-    logger.info("Loading YOLO11 Body Model (GPU)...")
+    logger.info("Loading YOLO Body Model (GPU)...")
     yolo_body_model = YOLO(YOLO_MODELS[server_data['yolo_model_key']], verbose=False)
     yolo_body_model.to(DEVICE_STR) 
 
@@ -290,7 +283,6 @@ def _load_resources():
         except: 
             with data_lock: server_data["face_enhancement_mode"] = "off_disabled"
             
-    # Init DeepFace Model to cache it
     if DEEPFACE_AVAILABLE:
         logger.info("Initializing ArcFace Model...")
         DeepFace.build_model("ArcFace")
@@ -330,7 +322,7 @@ def video_processing_thread():
     global person_registry, last_face_locations
     
     frame_count = 0
-    # Reduce thread workers to prevent choking the GPU feeder
+    # Fewer workers = less context switching for GPU
     executor = ThreadPoolExecutor(max_workers=4) 
 
     while not APP_SHOULD_QUIT:
@@ -356,10 +348,9 @@ def video_processing_thread():
             track_ids = body_results[0].boxes.id.cpu().numpy().astype(int)
             for box, track_id in zip(boxes, track_ids):
                 l, t, r, b = box
-                body_boxes[track_id] = (t, r, b, l) # Top, Right, Bottom, Left
+                body_boxes[track_id] = (t, r, b, l) 
                 active_track_ids.append(track_id)
                 if track_id not in person_registry:
-                    # Initial state
                     person_registry[track_id] = {"name": "Unknown", "dist": 1.0, "last_seen": time.time()}
 
         # 2. YOLO Face Detection (GPU)
@@ -370,7 +361,6 @@ def video_processing_thread():
             if len(face_results) > 0:
                 for box in face_results[0].boxes.xyxy.cpu().numpy().astype(int):
                     l, t, r, b = box
-                    # Store as Top, Right, Bottom, Left
                     current_face_locations.append((t, r, b, l)) 
             
             last_face_locations = current_face_locations
@@ -382,81 +372,52 @@ def video_processing_thread():
                 body_id = get_best_matching_body(face_loc, body_boxes)
                 
                 if body_id is not None:
-                    # Crop Face
                     top, right, bottom, left = face_loc
                     
-                    # Pad the crop slightly to help recognition
+                    # Pad
                     t_pad = max(0, top - 20); b_pad = min(frame.shape[0], bottom + 20)
                     l_pad = max(0, left - 20); r_pad = min(frame.shape[1], right + 20)
-                    
                     face_crop = rgb_frame[t_pad:b_pad, l_pad:r_pad]
                     
-                    # GFPGAN Enhancement (Crucial for Far Away faces)
+                    # GFPGAN
                     if GFPGAN_AVAILABLE and enhancement_mode == "on" and gfpgan_enhancer:
                          try:
-                             # Convert to BGR for GFPGAN
                              crop_bgr = cv2.cvtColor(face_crop, cv2.COLOR_RGB2BGR)
-                             _, _, restored_face = gfpgan_enhancer.enhance(
-                                 crop_bgr, has_aligned=False, only_center_face=True, paste_back=False
-                             )
+                             _, _, restored_face = gfpgan_enhancer.enhance(crop_bgr, has_aligned=False, only_center_face=True, paste_back=False)
                              if restored_face is not None:
                                  face_crop = cv2.cvtColor(restored_face, cv2.COLOR_BGR2RGB)
                          except: pass 
 
-                    # Generate ArcFace Embedding
+                    # ArcFace Embedding
                     try:
                         embedding_objs = DeepFace.represent(
                             img_path=face_crop,
                             model_name="ArcFace",
                             enforce_detection=False,
-                            detector_backend="skip"
+                            detector_backend="skip" # We already cropped it with YOLO
                         )
                         target_emb = embedding_objs[0]["embedding"]
-                        
-                        # Match against DB
                         name, distance = find_best_match_arcface(target_emb)
                         
-                        # --- SMART STICKY LOGIC (DISTANCE BASED) ---
-                        # ArcFace Distance: 0.0 (Identical) -> 1.0 (Different)
-                        # Threshold is roughly 0.65
-                        
-                        current_data = person_registry[body_id]
-                        curr_name = current_data["name"]
-                        curr_dist = current_data["dist"]
-                        
+                        # Smart Update
+                        curr_data = person_registry[body_id]
+                        curr_name = curr_data["name"]
+                        curr_dist = curr_data["dist"]
                         update = False
                         
-                        if distance < ARCFACE_THRESHOLD:
-                            # Match Found!
-                            if curr_name == "Unknown":
-                                update = True # Found someone new
-                            elif name == curr_name:
-                                # Same person, update if this view is clearer (lower distance)
-                                if distance < curr_dist:
-                                    update = True
-                            elif name != curr_name:
-                                # Identity Conflict. Only override if this match is WAY better
-                                # e.g. current is 0.60, new is 0.30
-                                if distance < (curr_dist - 0.15):
-                                    update = True
-                        else:
-                            # No Match (Unknown)
-                            # Only set to Unknown if we essentially have NO idea who this is
-                            # and the previous lock was weak
-                            if curr_name != "Unknown" and distance > 0.8 and curr_dist > 0.6:
-                                # Maybe they left and came back? 
-                                pass 
-
+                        # 0.65 threshold
+                        if distance < 0.65: 
+                            if curr_name == "Unknown": update = True
+                            elif name == curr_name and distance < curr_dist: update = True
+                            elif name != curr_name and distance < (curr_dist - 0.15): update = True
+                        
                         if update:
                             person_registry[body_id]["name"] = name
                             person_registry[body_id]["dist"] = distance
-                            
                         person_registry[body_id]["last_seen"] = time.time()
-                        
-                    except Exception: pass
+                    except: pass
 
         # 4. Drawing
-        # Draw Face Boxes (Yellow)
         for (ft, fr, fb, fl) in last_face_locations:
             cv2.rectangle(frame, (fl, ft), (fr, fb), COLOR_FACE_BOX, 2)
 
@@ -466,14 +427,10 @@ def video_processing_thread():
             data = person_registry.get(track_id, {"name": "Unknown", "dist": 1.0})
             name = data["name"]
             dist = data["dist"]
-            
-            # Confidence for display (inverted distance)
-            # 0.0 dist = 100% conf, 1.0 dist = 0% conf
             conf_display = max(0, min(100, int((1.0 - dist) * 100)))
-            
             color = COLOR_BODY_KNOWN if name != "Unknown" else COLOR_BODY_UNKNOWN
-            cv2.rectangle(frame, (l, t), (r, b), color, 2)
             
+            cv2.rectangle(frame, (l, t), (r, b), color, 2)
             label = f"{name}"
             if name != "Unknown": label += f" ({conf_display}%)"
             

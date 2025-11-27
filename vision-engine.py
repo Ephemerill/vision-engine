@@ -1,13 +1,22 @@
 import os
 import warnings
 
-# --- GPU MEMORY SETTINGS (Must be first) ---
-os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+# --- CRITICAL STABILITY FIX ---
+# 1. Hide GPU from TensorFlow (ArcFace) to prevent "No DNN" crashes.
+#    This lets YOLO (PyTorch) have exclusive access to the GPU.
+os.environ["CUDA_VISIBLE_DEVICES"] = "0" # Visible to system
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 
-# Silence specific library warnings
-warnings.filterwarnings("ignore", category=UserWarning)
-warnings.filterwarnings("ignore", category=FutureWarning)
+# 2. Silence library noise
+warnings.filterwarnings("ignore")
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3" 
+
+# 3. Configure TensorFlow CPU-Only Mode (Must be done before other imports)
+import tensorflow as tf
+try:
+    # Hide GPU from TF so it runs on CPU (Stable)
+    tf.config.set_visible_devices([], 'GPU')
+except: pass
 
 import cv2
 import face_recognition 
@@ -43,10 +52,12 @@ logger = logging.getLogger("VisionEngine")
 if torch.cuda.is_available():
     DEVICE_STR = 'cuda:0'
     gpu_name = torch.cuda.get_device_name(0)
-    logger.info(f"✅ GPU DETECTED: {gpu_name}")
+    logger.info(f"✅ YOLO/PyTorch using GPU: {gpu_name}")
 else:
     DEVICE_STR = 'cpu'
     logger.warning("⚠️  CRITICAL: GPU NOT DETECTED. Running on CPU.")
+
+logger.info("ℹ️  ArcFace Recognition configured for CPU (Stability Mode).")
 
 # --- IMPORTS ---
 try:
@@ -101,7 +112,7 @@ CURRENT_STREAM_SOURCE = STREAM_PI_RTSP
 server_data = {
     "is_recording": False, "keyframe_count": 0, "action_result": "", "live_faces": [],
     "model": MODEL_GEMMA, 
-    "yolo_model_key": "l", # Defaulting to Large for better accuracy
+    "yolo_model_key": "l", 
     "yolo_conf": 0.4, 
     "face_enhancement_mode": "on" 
 }
@@ -145,7 +156,7 @@ def load_known_faces(known_faces_dir):
     if not os.path.exists(known_faces_dir): return
     
     known_face_db = {}
-    logger.info(f"Loading/Embedding faces with ArcFace...")
+    logger.info(f"Loading faces from {known_faces_dir} (CPU)...")
     count = 0
     
     if not DEEPFACE_AVAILABLE: return
@@ -161,8 +172,7 @@ def load_known_faces(known_faces_dir):
             if filename.lower().endswith((".jpg", ".png", ".jpeg")):
                 image_path = os.path.join(person_dir, filename)
                 try:
-                    # UPDATED: Use 'opencv' backend to find the face in the reference photo.
-                    # 'skip' was causing issues if the reference image wasn't already cropped.
+                    # 'opencv' detector is fast and CPU friendly
                     embedding_objs = DeepFace.represent(
                         img_path=image_path,
                         model_name="ArcFace",
@@ -174,8 +184,7 @@ def load_known_faces(known_faces_dir):
                         known_face_db[person_name].append(embedding)
                         count += 1
                 except Exception as e:
-                    # Print exact error to debug "0 vectors" issue
-                    logger.warning(f"Failed to load {filename}: {e}")
+                    logger.warning(f"Skipped {filename}: {e}")
                 
     logger.info(f"Loaded {count} face vectors for {len(known_face_db)} people.")
 
@@ -207,7 +216,6 @@ def get_best_matching_body(face_box, body_boxes):
 def find_best_match_arcface(target_embedding):
     best_name = "Unknown"
     best_distance = 1.0
-    # ArcFace Threshold: 0.65 is a good balance for distance
     ARCFACE_THRESHOLD = 0.65
     
     for name, embeddings_list in known_face_db.items():
@@ -266,7 +274,7 @@ def _load_resources():
         GFPGAN_AVAILABLE = True
     except: GFPGAN_AVAILABLE = False
 
-    logger.info("Loading YOLO Body Model (GPU)...")
+    logger.info("Loading YOLO11 Body Model (GPU)...")
     yolo_body_model = YOLO(YOLO_MODELS[server_data['yolo_model_key']], verbose=False)
     yolo_body_model.to(DEVICE_STR) 
 
@@ -285,6 +293,7 @@ def _load_resources():
             
     if DEEPFACE_AVAILABLE:
         logger.info("Initializing ArcFace Model...")
+        # This will now safely use CPU
         DeepFace.build_model("ArcFace")
 
     load_known_faces(KNOWN_FACES_DIR)
@@ -322,7 +331,6 @@ def video_processing_thread():
     global person_registry, last_face_locations
     
     frame_count = 0
-    # Fewer workers = less context switching for GPU
     executor = ThreadPoolExecutor(max_workers=4) 
 
     while not APP_SHOULD_QUIT:
@@ -351,6 +359,7 @@ def video_processing_thread():
                 body_boxes[track_id] = (t, r, b, l) 
                 active_track_ids.append(track_id)
                 if track_id not in person_registry:
+                    # Initial state
                     person_registry[track_id] = {"name": "Unknown", "dist": 1.0, "last_seen": time.time()}
 
         # 2. YOLO Face Detection (GPU)
@@ -361,25 +370,26 @@ def video_processing_thread():
             if len(face_results) > 0:
                 for box in face_results[0].boxes.xyxy.cpu().numpy().astype(int):
                     l, t, r, b = box
+                    # Store as Top, Right, Bottom, Left
                     current_face_locations.append((t, r, b, l)) 
             
             last_face_locations = current_face_locations
 
-            # 3. Recognition (ArcFace)
+            # 3. Recognition (ArcFace on CPU)
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             
             for face_loc in current_face_locations:
                 body_id = get_best_matching_body(face_loc, body_boxes)
                 
                 if body_id is not None:
+                    # Crop Face
                     top, right, bottom, left = face_loc
                     
-                    # Pad
                     t_pad = max(0, top - 20); b_pad = min(frame.shape[0], bottom + 20)
                     l_pad = max(0, left - 20); r_pad = min(frame.shape[1], right + 20)
                     face_crop = rgb_frame[t_pad:b_pad, l_pad:r_pad]
                     
-                    # GFPGAN
+                    # GFPGAN (GPU if enabled, PyTorch handles this safely)
                     if GFPGAN_AVAILABLE and enhancement_mode == "on" and gfpgan_enhancer:
                          try:
                              crop_bgr = cv2.cvtColor(face_crop, cv2.COLOR_RGB2BGR)
@@ -388,25 +398,25 @@ def video_processing_thread():
                                  face_crop = cv2.cvtColor(restored_face, cv2.COLOR_BGR2RGB)
                          except: pass 
 
-                    # ArcFace Embedding
+                    # ArcFace Embedding (Forced CPU)
                     try:
                         embedding_objs = DeepFace.represent(
                             img_path=face_crop,
                             model_name="ArcFace",
                             enforce_detection=False,
-                            detector_backend="skip" # We already cropped it with YOLO
+                            detector_backend="skip" 
                         )
                         target_emb = embedding_objs[0]["embedding"]
                         name, distance = find_best_match_arcface(target_emb)
                         
-                        # Smart Update
+                        # Sticky Logic
                         curr_data = person_registry[body_id]
                         curr_name = curr_data["name"]
                         curr_dist = curr_data["dist"]
                         update = False
                         
-                        # 0.65 threshold
-                        if distance < 0.65: 
+                        ARCFACE_THRESH = 0.65
+                        if distance < ARCFACE_THRESH: 
                             if curr_name == "Unknown": update = True
                             elif name == curr_name and distance < curr_dist: update = True
                             elif name != curr_name and distance < (curr_dist - 0.15): update = True

@@ -26,10 +26,8 @@ from ultralytics import YOLO
 RECOGNITION_TOLERANCE = 0.5 
 WEB_SERVER_PORT = 5005
 
-# --- MODEL SELECTION (YOLOv11 Face) ---
-# Options: yolov11n-face.pt (Fastest), yolov11s-face.pt (Balanced), yolov11m-face.pt (Accurate)
-# We default to 'n' (Nano) for the 2060 Super to ensure high FPS.
-FACE_MODEL_NAME = "yolov11l-face.pt"
+# --- YOLO FACE CONFIG ---
+FACE_MODEL_NAME = "yolov11n-face.pt"
 FACE_MODEL_URL = f"https://github.com/YapaLab/yolo-face/releases/download/v0.0.0/{FACE_MODEL_NAME}"
 
 # --- LOGGING SETUP ---
@@ -77,8 +75,8 @@ COLOR_BODY_UNKNOWN = (100, 100, 255)
 COLOR_FACE_BOX = (255, 255, 0) 
 COLOR_TEXT_FG = (255, 255, 255)
 
-# Default Body Models (Standard YOLO11)
-YOLO_MODELS = {"n": "yolo11n.pt", "s": "yolo11s.pt", "m": "yolo11m.pt", "l": "yolo11l.pt", "x": "yolo11x.pt"}
+# Default Body Models
+YOLO_MODELS = {"n": "yolo11n.pt", "s": "yolo11s.pt", "m": "yolo11m.pt", "l": "yolo11l.pt"}
 
 # --- GLOBAL STATE ---
 data_lock = threading.Lock()
@@ -91,7 +89,7 @@ CURRENT_STREAM_SOURCE = STREAM_PI_RTSP
 server_data = {
     "is_recording": False, "keyframe_count": 0, "action_result": "", "live_faces": [],
     "model": MODEL_GEMMA, 
-    "yolo_model_key": "l", # Body model size
+    "yolo_model_key": "l", 
     "yolo_conf": 0.4, 
     "face_enhancement_mode": "off" 
 }
@@ -102,6 +100,15 @@ if not GFPGAN_AVAILABLE:
 # --- RESOURCES ---
 known_face_encodings = []
 known_face_names = []
+# Registry structure: 
+# { 
+#   track_id: { 
+#       "name": "Unknown", 
+#       "conf": 0.0,        # Confidence of the RECOGNITION (0-100)
+#       "last_seen": time,
+#       "locked": False     # If True, requires very high confidence to change
+#   } 
+# }
 person_registry = {} 
 last_face_locations = [] 
 
@@ -114,14 +121,12 @@ gfpgan_enhancer = None
 def get_face_model_path():
     if os.path.exists(FACE_MODEL_NAME):
         return FACE_MODEL_NAME
-        
     logger.info(f"Downloading New Face Model ({FACE_MODEL_NAME})...")
     try:
         response = requests.get(FACE_MODEL_URL, stream=True)
         if response.status_code != 200:
             logger.error(f"Download failed: Status {response.status_code}")
             return None
-            
         with open(FACE_MODEL_NAME, 'wb') as f:
             for chunk in response.iter_content(chunk_size=8192):
                 f.write(chunk)
@@ -142,7 +147,6 @@ def resize_with_aspect_ratio(frame, max_w=640, max_h=480):
 def load_known_faces(known_faces_dir):
     global known_face_encodings, known_face_names
     if not os.path.exists(known_faces_dir): return
-    
     known_face_encodings.clear(); known_face_names.clear()
     logger.info(f"Loading faces from {known_faces_dir}...")
     count = 0
@@ -162,18 +166,57 @@ def load_known_faces(known_faces_dir):
                 except: pass
     logger.info(f"Loaded {count} known face identities.")
 
-def get_containing_body_box(face_box, body_boxes):
-    ft, fr, fb, fl = face_box
-    cx, cy = (fl + fr) / 2, (ft + fb) / 2
-    for track_id, (bt, br, bb, bl) in body_boxes.items():
-        if bl < cx < br and bt < cy < bb: return track_id
-    return None
+def calculate_iou(boxA, boxB):
+    # boxA = face (t, r, b, l) -> convert to (x1, y1, x2, y2)
+    # boxB = body (t, r, b, l) -> convert to (x1, y1, x2, y2)
+    
+    # Face format: Top, Right, Bottom, Left
+    # Body format: Top, Right, Bottom, Left
+    
+    # Convert to x1, y1, x2, y2
+    f_x1, f_y1, f_x2, f_y2 = boxA[3], boxA[0], boxA[1], boxA[2]
+    b_x1, b_y1, b_x2, b_y2 = boxB[3], boxB[0], boxB[1], boxB[2]
+
+    # Intersection coordinates
+    xA = max(f_x1, b_x1)
+    yA = max(f_y1, b_y1)
+    xB = min(f_x2, b_x2)
+    yB = min(f_y2, b_y2)
+
+    # Compute intersection area
+    interWidth = max(0, xB - xA)
+    interHeight = max(0, yB - yA)
+    interArea = interWidth * interHeight
+
+    # Compute areas of both boxes
+    boxAArea = (f_x2 - f_x1) * (f_y2 - f_y1)
+    # We really just care how much of the FACE is inside the BODY
+    # So we calculate Intersection / FaceArea ratio
+    if boxAArea == 0: return 0
+    return interArea / float(boxAArea)
+
+def get_best_matching_body(face_box, body_boxes):
+    """
+    Finds which body box contains the most of the face box.
+    Returns track_id or None.
+    """
+    best_iou = 0
+    best_id = None
+    
+    for track_id, body_box in body_boxes.items():
+        iou = calculate_iou(face_box, body_box)
+        # Threshold: Face must be at least 50% inside the body box
+        if iou > 0.5 and iou > best_iou:
+            best_iou = iou
+            best_id = track_id
+            
+    return best_id
 
 def get_ip_addresses():
     ips = []
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("100.100.100.100", 80)) # Use Tailscale IP hint
+        s.connect(("100.100.100.100", 80)) 
         ips.append(s.getsockname()[0])
         s.close()
     except: pass
@@ -201,7 +244,7 @@ def run_flask():
     try:
         app.run(host='0.0.0.0', port=WEB_SERVER_PORT, debug=False, use_reloader=False)
     except OSError:
-        logger.error(f"Port {WEB_SERVER_PORT} is in use. Please change WEB_SERVER_PORT or kill the process.")
+        logger.error(f"Port {WEB_SERVER_PORT} is in use.")
 
 # --- RESOURCE LOADING ---
 def _load_resources():
@@ -213,12 +256,10 @@ def _load_resources():
         GFPGAN_AVAILABLE = True
     except: GFPGAN_AVAILABLE = False
 
-    # 1. Body Tracking (Standard YOLO11)
     logger.info("Loading YOLO11 Body Model (GPU)...")
     yolo_body_model = YOLO(YOLO_MODELS[server_data['yolo_model_key']], verbose=False)
     yolo_body_model.to(DEVICE_STR) 
 
-    # 2. Face Detection (YOLOv11-Face)
     face_path = get_face_model_path()
     if face_path:
         logger.info(f"Loading Face Model: {face_path} (GPU)...")
@@ -227,7 +268,6 @@ def _load_resources():
     else:
         logger.error("Failed to load Face Model.")
 
-    # 3. Face Enhancement
     if GFPGAN_AVAILABLE:
         logger.info("Loading GFPGAN Weights...")
         try:
@@ -287,7 +327,7 @@ def video_processing_thread():
             enhancement_mode = server_data["face_enhancement_mode"]
             yolo_conf = server_data["yolo_conf"]
 
-        # 1. YOLO Body Tracking (YOLO11 - GPU)
+        # 1. YOLO Body Tracking
         body_results = yolo_body_model.track(frame, persist=True, classes=[0], conf=yolo_conf, verbose=False)
         body_boxes = {}; active_track_ids = []
         
@@ -296,12 +336,12 @@ def video_processing_thread():
             track_ids = body_results[0].boxes.id.cpu().numpy().astype(int)
             for box, track_id in zip(boxes, track_ids):
                 l, t, r, b = box
-                body_boxes[track_id] = (t, r, b, l)
+                body_boxes[track_id] = (t, r, b, l) # Top, Right, Bottom, Left
                 active_track_ids.append(track_id)
                 if track_id not in person_registry:
                     person_registry[track_id] = {"name": "Unknown", "conf": 0.0, "last_seen": time.time()}
 
-        # 2. YOLO Face Detection (YOLOv11 Face - GPU)
+        # 2. YOLO Face Detection
         if frame_count % FACE_RECOGNITION_NTH_FRAME == 0 and yolo_face_model:
             face_results = yolo_face_model.predict(frame, conf=FACE_CONFIDENCE_THRESH, verbose=False)
             
@@ -309,15 +349,18 @@ def video_processing_thread():
             if len(face_results) > 0:
                 for box in face_results[0].boxes.xyxy.cpu().numpy().astype(int):
                     l, t, r, b = box
-                    current_face_locations.append((t, r, b, l)) # Top, Right, Bottom, Left
+                    # Store as Top, Right, Bottom, Left for face_recognition compatibility
+                    current_face_locations.append((t, r, b, l)) 
             
             last_face_locations = current_face_locations
 
-            # 3. Recognition (Dlib CPU)
+            # 3. Recognition Logic (Smart Sticky Update)
             rgb_frame_for_encoding = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             
             for face_loc in current_face_locations:
-                body_id = get_containing_body_box(face_loc, body_boxes)
+                # Use IoU matching instead of simple center point
+                body_id = get_best_matching_body(face_loc, body_boxes)
+                
                 if body_id is not None:
                     top, right, bottom, left = face_loc
                     
@@ -340,18 +383,48 @@ def video_processing_thread():
 
                     face_enc = face_recognition.face_encodings(input_image_encoding, encoding_loc)
                     
-                    name = "Unknown"; conf = 0.0
+                    new_name = "Unknown"; new_conf = 0.0
+                    
                     if face_enc and len(known_face_encodings) > 0:
                         matches = face_recognition.compare_faces(known_face_encodings, face_enc[0], tolerance=RECOGNITION_TOLERANCE)
                         dists = face_recognition.face_distance(known_face_encodings, face_enc[0])
                         if True in matches:
                             best_idx = np.argmin(dists)
-                            name = known_face_names[best_idx]
-                            conf = max(0, min(100, (1.0 - dists[best_idx]) * 100))
+                            new_name = known_face_names[best_idx]
+                            new_conf = max(0, min(100, (1.0 - dists[best_idx]) * 100))
                     
-                    if name != "Unknown":
-                        person_registry[body_id]["name"] = name
-                        person_registry[body_id]["conf"] = conf
+                    # --- SMART UPDATE LOGIC ---
+                    current_data = person_registry[body_id]
+                    current_name = current_data["name"]
+                    current_conf = current_data["conf"]
+                    
+                    should_update = False
+                    
+                    if new_name != "Unknown":
+                        # Case 1: We found a name.
+                        if current_name == "Unknown":
+                            # Always update from Unknown -> Known
+                            should_update = True
+                        elif new_name == current_name:
+                            # Re-confirming same person, update if confidence is decent
+                            if new_conf > current_conf - 10: # Allow slight dips
+                                should_update = True
+                        else:
+                            # CONFLICT: ID says "John", but face says "Bob"
+                            # Only overwrite if new confidence is significantly higher
+                            if new_conf > current_conf + 15:
+                                should_update = True
+                    else:
+                        # Case 2: Face seen, but not recognized (Unknown)
+                        # Do NOT overwrite a known name with "Unknown" just because of a bad angle
+                        # Only overwrite if the existing confidence was very low to begin with
+                        if current_name != "Unknown" and current_conf < 40:
+                            should_update = True
+
+                    if should_update:
+                        person_registry[body_id]["name"] = new_name
+                        person_registry[body_id]["conf"] = new_conf
+                    
                     person_registry[body_id]["last_seen"] = time.time()
 
         # 4. Drawing
@@ -366,7 +439,9 @@ def video_processing_thread():
             color = COLOR_BODY_KNOWN if name != "Unknown" else COLOR_BODY_UNKNOWN
             
             cv2.rectangle(frame, (l, t), (r, b), color, 2)
-            label = f"{track_id}: {name}"
+            
+            # Label without Track ID (Clean)
+            label = f"{name}"
             if name != "Unknown": label += f" ({int(conf)}%)"
             
             (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)

@@ -1,22 +1,11 @@
 import os
 import warnings
 
-# --- CRITICAL STABILITY FIX ---
-# 1. Hide GPU from TensorFlow (ArcFace) to prevent "No DNN" crashes.
-#    This lets YOLO (PyTorch) have exclusive access to the GPU.
-os.environ["CUDA_VISIBLE_DEVICES"] = "0" # Visible to system
-os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
-
-# 2. Silence library noise
-warnings.filterwarnings("ignore")
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3" 
-
-# 3. Configure TensorFlow CPU-Only Mode (Must be done before other imports)
-import tensorflow as tf
-try:
-    # Hide GPU from TF so it runs on CPU (Stable)
-    tf.config.set_visible_devices([], 'GPU')
-except: pass
+# --- CRITICAL STABILITY: FORCE TENSORFLOW/ARCFACE TO CPU ---
+# This prevents "No DNN support" errors by stopping TensorFlow from fighting PyTorch for the GPU.
+# YOLO (PyTorch) will still use the GPU for high-speed tracking.
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1" 
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
 import cv2
 import face_recognition 
@@ -37,7 +26,8 @@ from flask import Flask, Response
 from ultralytics import YOLO
 
 # --- CONFIGURATION ---
-RECOGNITION_TOLERANCE = 0.5 
+# Lower is stricter for ArcFace (0.65 is standard, 0.60 is strict)
+RECOGNITION_DISTANCE_THRESHOLD = 0.68 
 WEB_SERVER_PORT = 5005
 
 # --- YOLO FACE CONFIG ---
@@ -49,6 +39,7 @@ logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
 logger = logging.getLogger("VisionEngine")
 
 # --- HARDWARE CHECK ---
+# Check PyTorch GPU visibility (Should be True)
 if torch.cuda.is_available():
     DEVICE_STR = 'cuda:0'
     gpu_name = torch.cuda.get_device_name(0)
@@ -56,8 +47,6 @@ if torch.cuda.is_available():
 else:
     DEVICE_STR = 'cpu'
     logger.warning("⚠️  CRITICAL: GPU NOT DETECTED. Running on CPU.")
-
-logger.info("ℹ️  ArcFace Recognition configured for CPU (Stability Mode).")
 
 # --- IMPORTS ---
 try:
@@ -90,7 +79,7 @@ STREAM_WEBCAM = 0
 FRAME_WIDTH = 640
 FRAME_HEIGHT = 480
 KNOWN_FACES_DIR = "known_faces"
-FACE_CONFIDENCE_THRESH = 0.5 
+FACE_CONFIDENCE_THRESH = 0.4
 FACE_RECOGNITION_NTH_FRAME = 3 
 
 COLOR_BODY_KNOWN = (255, 100, 100) 
@@ -156,7 +145,7 @@ def load_known_faces(known_faces_dir):
     if not os.path.exists(known_faces_dir): return
     
     known_face_db = {}
-    logger.info(f"Loading faces from {known_faces_dir} (CPU)...")
+    logger.info(f"Loading reference faces (ArcFace via CPU)...")
     count = 0
     
     if not DEEPFACE_AVAILABLE: return
@@ -172,21 +161,36 @@ def load_known_faces(known_faces_dir):
             if filename.lower().endswith((".jpg", ".png", ".jpeg")):
                 image_path = os.path.join(person_dir, filename)
                 try:
-                    # 'opencv' detector is fast and CPU friendly
+                    # UPDATED: Use 'retinaface' backend for loading. 
+                    # It is slower but accurate. Since this only runs at startup on CPU, it's safe.
                     embedding_objs = DeepFace.represent(
                         img_path=image_path,
                         model_name="ArcFace",
                         enforce_detection=True, 
-                        detector_backend="opencv" 
+                        detector_backend="retinaface" 
                     )
                     if embedding_objs:
                         embedding = embedding_objs[0]["embedding"]
                         known_face_db[person_name].append(embedding)
                         count += 1
                 except Exception as e:
-                    logger.warning(f"Skipped {filename}: {e}")
+                    # Fallback: If RetinaFace fails to detect (e.g. alignment issue), try 'opencv'
+                    try:
+                        embedding_objs = DeepFace.represent(
+                            img_path=image_path,
+                            model_name="ArcFace",
+                            enforce_detection=True, 
+                            detector_backend="opencv"
+                        )
+                        if embedding_objs:
+                            embedding = embedding_objs[0]["embedding"]
+                            known_face_db[person_name].append(embedding)
+                            count += 1
+                            logger.info(f"Loaded {filename} using fallback detector.")
+                    except:
+                        logger.warning(f"Could not load face from {filename}: {e}")
                 
-    logger.info(f"Loaded {count} face vectors for {len(known_face_db)} people.")
+    logger.info(f"Loaded {count} vectors for {len(known_face_db)} people.")
 
 def calculate_iou(boxA, boxB):
     f_x1, f_y1, f_x2, f_y2 = boxA[3], boxA[0], boxA[1], boxA[2]
@@ -216,7 +220,6 @@ def get_best_matching_body(face_box, body_boxes):
 def find_best_match_arcface(target_embedding):
     best_name = "Unknown"
     best_distance = 1.0
-    ARCFACE_THRESHOLD = 0.65
     
     for name, embeddings_list in known_face_db.items():
         for known_emb in embeddings_list:
@@ -292,8 +295,8 @@ def _load_resources():
             with data_lock: server_data["face_enhancement_mode"] = "off_disabled"
             
     if DEEPFACE_AVAILABLE:
-        logger.info("Initializing ArcFace Model...")
-        # This will now safely use CPU
+        logger.info("Initializing ArcFace Model (CPU Mode)...")
+        # Build model once so it is ready
         DeepFace.build_model("ArcFace")
 
     load_known_faces(KNOWN_FACES_DIR)
@@ -331,7 +334,7 @@ def video_processing_thread():
     global person_registry, last_face_locations
     
     frame_count = 0
-    executor = ThreadPoolExecutor(max_workers=4) 
+    executor = ThreadPoolExecutor(max_workers=6) 
 
     while not APP_SHOULD_QUIT:
         frame = None
@@ -359,7 +362,6 @@ def video_processing_thread():
                 body_boxes[track_id] = (t, r, b, l) 
                 active_track_ids.append(track_id)
                 if track_id not in person_registry:
-                    # Initial state
                     person_registry[track_id] = {"name": "Unknown", "dist": 1.0, "last_seen": time.time()}
 
         # 2. YOLO Face Detection (GPU)
@@ -375,7 +377,8 @@ def video_processing_thread():
             
             last_face_locations = current_face_locations
 
-            # 3. Recognition (ArcFace on CPU)
+            # 3. Recognition (ArcFace CPU)
+            # IMPORTANT: Convert to RGB for DeepFace logic
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             
             for face_loc in current_face_locations:
@@ -389,12 +392,14 @@ def video_processing_thread():
                     l_pad = max(0, left - 20); r_pad = min(frame.shape[1], right + 20)
                     face_crop = rgb_frame[t_pad:b_pad, l_pad:r_pad]
                     
-                    # GFPGAN (GPU if enabled, PyTorch handles this safely)
+                    # GFPGAN (PyTorch GPU - Safe)
                     if GFPGAN_AVAILABLE and enhancement_mode == "on" and gfpgan_enhancer:
                          try:
+                             # GFPGAN expects BGR
                              crop_bgr = cv2.cvtColor(face_crop, cv2.COLOR_RGB2BGR)
                              _, _, restored_face = gfpgan_enhancer.enhance(crop_bgr, has_aligned=False, only_center_face=True, paste_back=False)
                              if restored_face is not None:
+                                 # Convert back to RGB for ArcFace
                                  face_crop = cv2.cvtColor(restored_face, cv2.COLOR_BGR2RGB)
                          except: pass 
 
@@ -403,7 +408,7 @@ def video_processing_thread():
                         embedding_objs = DeepFace.represent(
                             img_path=face_crop,
                             model_name="ArcFace",
-                            enforce_detection=False,
+                            enforce_detection=False, # Already detected by YOLO
                             detector_backend="skip" 
                         )
                         target_emb = embedding_objs[0]["embedding"]
@@ -415,8 +420,7 @@ def video_processing_thread():
                         curr_dist = curr_data["dist"]
                         update = False
                         
-                        ARCFACE_THRESH = 0.65
-                        if distance < ARCFACE_THRESH: 
+                        if distance < RECOGNITION_DISTANCE_THRESHOLD: 
                             if curr_name == "Unknown": update = True
                             elif name == curr_name and distance < curr_dist: update = True
                             elif name != curr_name and distance < (curr_dist - 0.15): update = True

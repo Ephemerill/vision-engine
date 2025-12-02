@@ -27,9 +27,7 @@ WEB_SERVER_PORT = 5005
 BOX_PADDING = 40
 
 # --- PERFORMANCE TUNING ---
-# If we know who you are with this confidence, we stop re-scanning you for a while.
 HIGH_CONFIDENCE_THRESHOLD = 65.0 
-# How long (seconds) to trust the tracker before running heavy recognition again
 RECOGNITION_COOLDOWN = 2.0 
 
 # --- YOLO FACE CONFIG ---
@@ -50,12 +48,14 @@ else:
     logger.warning("⚠️  CRITICAL: GPU NOT DETECTED. Running on CPU.")
 
 # --- IMPORTS (PYTORCH ONLY) ---
-try:
-    import gfpgan
-    GFPGAN_AVAILABLE = True
-except ImportError:
-    GFPGAN_AVAILABLE = False
-    logger.warning("⚠️  GFPGAN library not found. Enhancement will be disabled.")
+# DISABLED GFPGAN
+GFPGAN_AVAILABLE = False
+# try:
+#     import gfpgan
+#     GFPGAN_AVAILABLE = True
+# except ImportError:
+#     GFPGAN_AVAILABLE = False
+#     logger.warning("⚠️  GFPGAN library not found. Enhancement will be disabled.")
 
 # --- FLASK APP ---
 app = Flask(__name__)
@@ -98,7 +98,7 @@ server_data = {
     "model": MODEL_GEMMA, 
     "yolo_model_key": "n", 
     "yolo_conf": 0.4, 
-    "face_enhancement_mode": "on"
+    "face_enhancement_mode": "off" # FORCED OFF
 }
 
 if not GFPGAN_AVAILABLE:
@@ -113,7 +113,7 @@ known_face_names = []
 #       "name": "Unknown", 
 #       "conf": 0.0,
 #       "last_seen": time,
-#       "last_recog_time": time  <-- Added for optimization
+#       "last_recog_time": time 
 #   } 
 # }
 person_registry = {} 
@@ -238,13 +238,13 @@ def run_flask():
 def _load_resources():
     global GFPGANer, GFPGAN_AVAILABLE, yolo_body_model, yolo_face_model, gfpgan_enhancer
     
-    logger.info("Loading GFPGAN...")
-    try:
-        from gfpgan import GFPGANer as G; GFPGANer = G
-        GFPGAN_AVAILABLE = True
-    except: 
-        logger.error("Could not load GFPGANer class.")
-        GFPGAN_AVAILABLE = False
+    # logger.info("Loading GFPGAN...")
+    # try:
+    #     from gfpgan import GFPGANer as G; GFPGANer = G
+    #     GFPGAN_AVAILABLE = True
+    # except: 
+    #     logger.error("Could not load GFPGANer class.")
+    #     GFPGAN_AVAILABLE = False
 
     logger.info("Loading YOLO11 Body Model (GPU)...")
     yolo_body_model = YOLO(YOLO_MODELS[server_data['yolo_model_key']], verbose=False)
@@ -302,9 +302,6 @@ def video_processing_thread():
     global person_registry, last_face_locations
     
     frame_count = 0
-    # ThreadPoolExecutor removed: It's often counter-productive with OpenCV/Python GIL for real-time video 
-    # when doing CPU-heavy bound tasks like face_recognition unless carefully managed. 
-    # Single-threaded logic optimization is cleaner here.
 
     while not APP_SHOULD_QUIT:
         frame = None
@@ -315,7 +312,6 @@ def video_processing_thread():
             time.sleep(0.01)
             continue
 
-        # Resize early to save compute on all subsequent steps
         frame = resize_with_aspect_ratio(frame, max_w=FRAME_WIDTH, max_h=FRAME_HEIGHT)
         if frame is None: continue
         frame_count += 1
@@ -324,7 +320,7 @@ def video_processing_thread():
             enhancement_mode = server_data["face_enhancement_mode"]
             yolo_conf = server_data["yolo_conf"]
 
-        # 1. YOLO Body Tracking (Fast, runs every loop)
+        # 1. YOLO Body Tracking
         body_results = yolo_body_model.track(frame, persist=True, classes=[0], conf=yolo_conf, verbose=False)
         body_boxes = {}; active_track_ids = []
         
@@ -340,11 +336,10 @@ def video_processing_thread():
                         "name": "Unknown", 
                         "conf": 0.0, 
                         "last_seen": time.time(),
-                        "last_recog_time": 0.0 # Initialize new field
+                        "last_recog_time": 0.0
                     }
 
         # 2. YOLO Face Detection & Recognition
-        # Only run every Nth frame to save massive resources
         if frame_count % FACE_RECOGNITION_NTH_FRAME == 0 and yolo_face_model:
             face_results = yolo_face_model.predict(frame, conf=FACE_CONFIDENCE_THRESH, verbose=False)
             
@@ -361,48 +356,21 @@ def video_processing_thread():
                 body_id = get_best_matching_body(face_loc, body_boxes)
                 
                 if body_id is not None:
-                    # --- OPTIMIZATION: RECOGNITION LOCKING ---
                     current_data = person_registry[body_id]
                     now = time.time()
                     
-                    # If we know them with high confidence and checked recently, SKIP heavy processing
-                    # This prevents running GFPGAN + FaceRecog on known people every 3 frames
                     if (current_data["name"] != "Unknown" and 
                         current_data["conf"] > HIGH_CONFIDENCE_THRESHOLD and 
                         (now - current_data["last_recog_time"]) < RECOGNITION_COOLDOWN):
-                        # Update "last_seen" so the label stays, but don't re-compute
                         person_registry[body_id]["last_seen"] = now
                         continue 
 
-                    # If we are here, we need to recognize/re-verify
                     top, right, bottom, left = face_loc
                     input_image_encoding = rgb_frame_for_encoding
                     
-                    # --- OPTIMIZATION: CONDITIONAL ENHANCEMENT ---
-                    # Only run GFPGAN if we really need it (confidence is low or unknown)
-                    # or if specifically requested. 
-                    should_enhance = (GFPGAN_AVAILABLE and enhancement_mode == "on" and gfpgan_enhancer)
-                    
-                    if should_enhance:
-                         t_pad = max(0, top - BOX_PADDING); b_pad = min(frame.shape[0], bottom + BOX_PADDING)
-                         l_pad = max(0, left - BOX_PADDING); r_pad = min(frame.shape[1], right + BOX_PADDING)
-                         face_crop_bgr = frame[t_pad:b_pad, l_pad:r_pad]
-                         try:
-                             _, _, restored_face = gfpgan_enhancer.enhance(
-                                 face_crop_bgr, has_aligned=False, only_center_face=True, paste_back=False
-                             )
-                             if restored_face is not None:
-                                 input_image_encoding = cv2.cvtColor(restored_face, cv2.COLOR_BGR2RGB)
-                                 encoding_loc = [(0, input_image_encoding.shape[1], input_image_encoding.shape[0], 0)]
-                             else:
-                                 encoding_loc = [face_loc]
-                         except Exception as e:
-                             logger.error(f"Enhancement error: {e}")
-                             encoding_loc = [face_loc] 
-                    else:
-                        encoding_loc = [face_loc]
+                    # GFPGAN BLOCK REMOVED/DISABLED IN LOGIC
+                    encoding_loc = [face_loc]
 
-                    # Actual Recognition (CPU Heavy)
                     face_enc = face_recognition.face_encodings(input_image_encoding, encoding_loc)
                     
                     new_name = "Unknown"; new_conf = 0.0
@@ -415,7 +383,6 @@ def video_processing_thread():
                             new_name = known_face_names[best_idx]
                             new_conf = max(0, min(100, (1.0 - dists[best_idx]) * 100))
                     
-                    # --- SMART UPDATE LOGIC ---
                     current_name = current_data["name"]
                     current_conf = current_data["conf"]
                     should_update = False
@@ -434,7 +401,7 @@ def video_processing_thread():
                         person_registry[body_id]["conf"] = new_conf
                     
                     person_registry[body_id]["last_seen"] = now
-                    person_registry[body_id]["last_recog_time"] = now # Mark that we just did the heavy lifting
+                    person_registry[body_id]["last_recog_time"] = now
 
         # 4. Drawing
         for (ft, fr, fb, fl) in last_face_locations:
@@ -464,7 +431,7 @@ def video_processing_thread():
 # --- MAIN ---
 if __name__ == "__main__":
     print("---------------------------------------------------")
-    print(" HEADLESS VISION ENGINE STARTING ")
+    print(" HEADLESS VISION ENGINE STARTING (NO ENHANCEMENT) ")
     print("---------------------------------------------------")
     
     reader = threading.Thread(target=_frame_reader_loop, args=(CURRENT_STREAM_SOURCE,), daemon=True)

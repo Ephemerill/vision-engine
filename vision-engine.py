@@ -16,6 +16,7 @@ import traceback
 import socket
 import logging
 import requests
+import queue
 from concurrent.futures import ThreadPoolExecutor
 import torch
 from flask import Flask, Response
@@ -28,6 +29,8 @@ BOX_PADDING = 40
 DIAGNOSTICS_INTERVAL = 5.0 
 HIGH_CONFIDENCE_THRESHOLD = 65.0 
 RECOGNITION_COOLDOWN = 2.0 
+UNKNOWN_RETRY_LIMIT = 5          # How many times to try recognizing a stranger
+UNKNOWN_LOCKOUT_TIME = 30.0      # How long to ignore a stranger after failing (seconds)
 
 # --- YOLO FACE CONFIG ---
 FACE_MODEL_NAME = "yolov11n-face.pt"
@@ -63,31 +66,38 @@ FACE_CONFIDENCE_THRESH = 0.5
 FACE_RECOGNITION_NTH_FRAME = 3 
 
 COLOR_BODY_KNOWN = (255, 100, 100) 
-COLOR_BODY_UNKNOWN = (100, 100, 255) 
+COLOR_BODY_UNKNOWN = (100, 100, 255)
+COLOR_BODY_VISITOR = (150, 150, 150) # Gray for people we gave up on 
 COLOR_FACE_BOX = (255, 255, 0) 
 COLOR_TEXT_FG = (255, 255, 255)
 
 YOLO_MODELS = {"n": "yolo11n.pt", "s": "yolo11s.pt", "m": "yolo11m.pt", "l": "yolo11l.pt"}
 
 # --- GLOBAL STATE ---
-# We use separate locks to prevent the web server from blocking the AI
 video_lock = threading.Lock()
 results_lock = threading.Lock()
+registry_lock = threading.Lock()
 
-latest_raw_frame = None       # Raw frame from camera (High FPS)
-latest_processed_results = {  # AI results to draw (Slower update rate)
+latest_raw_frame = None       
+latest_processed_results = {  
     "body_boxes": {},
     "active_ids": [],
     "face_boxes": [],
-    "registry": {}
 }
+
+# The Registry: The Source of Truth for Names
+# { track_id: { "name": "Dave", "conf": 98.0, "last_recog": 0.0, "retries": 0, "status": "known" } }
+person_registry = {} 
+
+# The Queue: Jobs for the slow CPU thread
+recog_queue = queue.Queue(maxsize=1) # Keep queue small to prevent backlog lag
 
 APP_SHOULD_QUIT = False
 CURRENT_STREAM_SOURCE = STREAM_PI_RTSP 
 
 perf_stats = {
     "fps": 0, "body_ms": 0, "face_det_ms": 0, "face_rec_ms": 0,
-    "last_print": time.time(), "frame_counter": 0
+    "last_print": time.time(), "frame_counter": 0, "active_jobs": 0
 }
 
 server_data = {
@@ -113,7 +123,8 @@ def print_diagnostics():
         print(f"\n=== DIAGNOSTICS (FPS: {fps:.2f} | VRAM: {vram:.0f}MB) ===")
         print(f" > YOLO Body:   {perf_stats['body_ms']:.1f} ms")
         print(f" > YOLO Face:   {perf_stats['face_det_ms']:.1f} ms")
-        print(f" > Face Recog:  {perf_stats['face_rec_ms']:.1f} ms")
+        print(f" > Face Recog:  {perf_stats['face_rec_ms']:.1f} ms (Async Thread)")
+        print(f" > Queue Size:  {recog_queue.qsize()}")
         print("==============================================\n")
         
         perf_stats["last_print"] = now; perf_stats["frame_counter"] = 0; perf_stats["face_rec_ms"] = 0
@@ -184,57 +195,60 @@ def index():
 
 def generate_frames():
     # --- DECOUPLED RENDERING LOOP ---
-    # This loop runs independently of the AI speed. It just grabs the latest frame,
-    # grabs the latest KNOWN AI data, draws it, and sends it.
-    
     while True:
-        # 1. Get raw frame (Fast)
         frame = None
         with video_lock:
-            if latest_raw_frame is not None: 
-                frame = latest_raw_frame.copy()
+            if latest_raw_frame is not None: frame = latest_raw_frame.copy()
         
         if frame is None:
-            time.sleep(0.02)
-            continue
+            time.sleep(0.02); continue
 
-        # 2. Resize for display (Consistent with AI coords)
         frame = resize_with_aspect_ratio(frame, max_w=FRAME_WIDTH, max_h=FRAME_HEIGHT)
 
-        # 3. Get latest AI results (Non-blocking copy)
+        # Get Tracking Data
         ai_data = None
-        with results_lock:
-            ai_data = latest_processed_results.copy() # Shallow copy is fast enough
+        with results_lock: ai_data = latest_processed_results.copy()
+        
+        # Get Registry Data (Thread Safe copy)
+        current_registry = {}
+        with registry_lock: current_registry = person_registry.copy()
 
-        # 4. Draw overlay (Happens on the Flask thread, not AI thread)
         if ai_data:
             # Draw Faces
             for (ft, fr, fb, fl) in ai_data["face_boxes"]:
                 cv2.rectangle(frame, (fl, ft), (fr, fb), COLOR_FACE_BOX, 2)
             
-            # Draw Bodies & Names
+            # Draw Bodies
             for track_id in ai_data["active_ids"]:
                 if track_id in ai_data["body_boxes"]:
                     t, r, b, l = ai_data["body_boxes"][track_id]
-                    p_data = ai_data["registry"].get(track_id, {"name": "Unknown", "conf": 0})
-                    name = p_data["name"]; conf = p_data["conf"]
                     
-                    color = COLOR_BODY_KNOWN if name != "Unknown" else COLOR_BODY_UNKNOWN
+                    # Defaults
+                    name = "Scanning..."; conf = 0; color = COLOR_BODY_UNKNOWN
+                    
+                    if track_id in current_registry:
+                        p_data = current_registry[track_id]
+                        name = p_data["name"]
+                        conf = p_data["conf"]
+                        
+                        if name != "Unknown" and name != "Scanning...":
+                            color = COLOR_BODY_KNOWN
+                        elif p_data.get("status") == "visitor":
+                            name = "Visitor"
+                            color = COLOR_BODY_VISITOR
+                    
                     cv2.rectangle(frame, (l, t), (r, b), color, 2)
                     
                     label = f"{name}"
-                    if name != "Unknown": label += f" ({int(conf)}%)"
+                    if conf > 0: label += f" ({int(conf)}%)"
                     
                     (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
                     cv2.rectangle(frame, (l, t - 25), (l + tw + 10, t), color, -1)
                     cv2.putText(frame, label, (l + 5, t - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLOR_TEXT_FG, 2)
 
-        # 5. Encode
         (flag, encodedImage) = cv2.imencode(".jpg", frame)
-        if not flag: continue
-        yield(b'--frame\r\n' b'Content-Type: image/jpeg\r\n\r\n' + bytearray(encodedImage) + b'\r\n')
-        
-        # Cap sending rate to ~30fps to save bandwidth/cpu
+        if flag:
+            yield(b'--frame\r\n' b'Content-Type: image/jpeg\r\n\r\n' + bytearray(encodedImage) + b'\r\n')
         time.sleep(0.03) 
 
 @app.route('/video_feed')
@@ -259,59 +273,96 @@ def _load_resources():
         yolo_face_model.to(DEVICE_STR)
     load_known_faces(KNOWN_FACES_DIR)
 
-# --- VIDEO READER ---
+# --- THREAD 1: VIDEO READER (60+ FPS) ---
 def _frame_reader_loop(source):
     global latest_raw_frame, APP_SHOULD_QUIT
-    
     logger.info(f"Starting Video Reader on: {source}")
     cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
-    
     while not APP_SHOULD_QUIT:
         if not cap.isOpened():
-            time.sleep(2)
-            cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
-            continue
-
+            time.sleep(2); cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG); continue
         ret, frame = cap.read()
         if not ret:
-            logger.warning("Stream dropped...")
-            cap.release()
-            continue
-            
-        # Update raw frame with minimal locking time
-        with video_lock:
-            latest_raw_frame = frame
-        
-        # Don't spin loop too fast (limit to ~60fps read)
+            logger.warning("Stream dropped..."); cap.release(); continue
+        with video_lock: latest_raw_frame = frame
         time.sleep(0.015) 
-        
     cap.release()
 
-# --- AI PROCESSING THREAD ---
-def video_processing_thread():
-    global latest_processed_results, perf_stats, person_registry
+# --- THREAD 2: RECOGNITION WORKER (CPU BOUND) ---
+def recognition_worker_thread():
+    global person_registry, perf_stats
+    logger.info("Background Recognition Worker Started.")
     
-    frame_count = 0
-    # Local registry state to persist between loops
-    local_registry = {} 
-    last_face_locs = []
-
     while not APP_SHOULD_QUIT:
-        # 1. Grab Frame
-        frame = None
-        with video_lock:
-            if latest_raw_frame is not None: 
-                frame = latest_raw_frame.copy()
-        
-        if frame is None:
-            time.sleep(0.01)
+        try:
+            # Block for 0.1s so we can check APP_SHOULD_QUIT
+            job = recog_queue.get(timeout=0.1) 
+        except queue.Empty:
             continue
 
+        # Job Structure: {"id": track_id, "frame": rgb_frame, "loc": face_loc}
+        track_id = job["id"]
+        rgb_frame = job["frame"]
+        face_loc = job["loc"]
+        
+        t_start = time.time()
+        
+        # 1. ENCODING (The heavy 1.3s part)
+        try:
+            encs = face_recognition.face_encodings(rgb_frame, [face_loc])
+        except Exception as e:
+            logger.error(f"Recog Error: {e}")
+            encs = []
+
+        new_name = "Unknown"
+        new_conf = 0.0
+
+        # 2. MATCHING
+        if encs and len(known_face_encodings) > 0:
+            matches = face_recognition.compare_faces(known_face_encodings, encs[0], tolerance=RECOGNITION_TOLERANCE)
+            dists = face_recognition.face_distance(known_face_encodings, encs[0])
+            if True in matches:
+                best_idx = np.argmin(dists)
+                new_name = known_face_names[best_idx]
+                new_conf = max(0, min(100, (1.0 - dists[best_idx]) * 100))
+        
+        # 3. UPDATE REGISTRY (Thread Safe)
+        with registry_lock:
+            if track_id in person_registry:
+                entry = person_registry[track_id]
+                
+                if new_name != "Unknown":
+                    # We found a match!
+                    entry["name"] = new_name
+                    entry["conf"] = new_conf
+                    entry["status"] = "known"
+                    entry["retries"] = 0 # Reset retries
+                else:
+                    # Still unknown
+                    entry["retries"] += 1
+                    if entry["retries"] >= UNKNOWN_RETRY_LIMIT:
+                        entry["status"] = "visitor"
+                        logger.info(f"ID {track_id} marked as Visitor (Stopped trying).")
+                
+                entry["last_recog"] = time.time()
+
+        perf_stats["face_rec_ms"] = (time.time() - t_start) * 1000
+
+# --- THREAD 3: TRACKING LOOP (GPU BOUND - 30 FPS) ---
+def video_processing_thread():
+    global latest_processed_results, perf_stats, person_registry
+    frame_count = 0
+
+    while not APP_SHOULD_QUIT:
+        frame = None
+        with video_lock:
+            if latest_raw_frame is not None: frame = latest_raw_frame.copy()
+        
+        if frame is None: time.sleep(0.01); continue
+        
         frame = resize_with_aspect_ratio(frame, max_w=FRAME_WIDTH, max_h=FRAME_HEIGHT)
         frame_count += 1
         perf_stats["frame_counter"] += 1
-        
-        # 2. AI Logic
         t0 = time.time()
         
         # --- YOLO BODY ---
@@ -324,12 +375,19 @@ def video_processing_thread():
         if body_results[0].boxes.id is not None:
             boxes = body_results[0].boxes.xyxy.cpu().numpy().astype(int)
             track_ids = body_results[0].boxes.id.cpu().numpy().astype(int)
-            for box, track_id in zip(boxes, track_ids):
-                l, t, r, b = box
-                body_boxes[track_id] = (t, r, b, l)
-                active_ids.append(track_id)
-                if track_id not in local_registry:
-                    local_registry[track_id] = {"name": "Unknown", "conf": 0.0, "last_recog": 0}
+            
+            with registry_lock:
+                for box, track_id in zip(boxes, track_ids):
+                    l, t, r, b = box
+                    body_boxes[track_id] = (t, r, b, l)
+                    active_ids.append(track_id)
+                    
+                    # Initialize in Registry if new
+                    if track_id not in person_registry:
+                        person_registry[track_id] = {
+                            "name": "Unknown", "conf": 0.0, 
+                            "last_recog": 0, "retries": 0, "status": "tracking"
+                        }
 
         # --- YOLO FACE ---
         if frame_count % FACE_RECOGNITION_NTH_FRAME == 0 and yolo_face_model:
@@ -342,65 +400,63 @@ def video_processing_thread():
                 for box in face_results[0].boxes.xyxy.cpu().numpy().astype(int):
                     l, t, r, b = box
                     curr_faces.append((t, r, b, l))
-            last_face_locs = curr_faces
             
-            # --- RECOGNITION ---
+            # --- DISPATCH TO WORKER ---
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            t2 = time.time()
             
             for face_loc in curr_faces:
                 bid = get_best_matching_body(face_loc, body_boxes)
                 if bid is not None:
-                    p = local_registry[bid]
-                    # Optimization: Skip if known & recently checked
-                    if p["name"] != "Unknown" and p["conf"] > HIGH_CONFIDENCE_THRESHOLD and (time.time() - p["last_recog"] < RECOGNITION_COOLDOWN):
-                        continue
-                    
-                    # Do Recognition
-                    encs = face_recognition.face_encodings(rgb, [face_loc])
-                    if encs and known_face_encodings:
-                        matches = face_recognition.compare_faces(known_face_encodings, encs[0], tolerance=RECOGNITION_TOLERANCE)
-                        dists = face_recognition.face_distance(known_face_encodings, encs[0])
+                    with registry_lock:
+                        p = person_registry.get(bid)
+                        if not p: continue
                         
-                        best_name = "Unknown"; best_conf = 0.0
-                        if True in matches:
-                            idx = np.argmin(dists)
-                            best_name = known_face_names[idx]
-                            best_conf = max(0, min(100, (1.0 - dists[idx]) * 100))
+                        now = time.time()
                         
-                        # Update logic
-                        if best_name != "Unknown":
-                            if p["name"] == "Unknown" or best_name == p["name"] or best_conf > p["conf"] + 15:
-                                local_registry[bid]["name"] = best_name
-                                local_registry[bid]["conf"] = best_conf
-                    
-                    local_registry[bid]["last_recog"] = time.time()
-            
-            perf_stats["face_rec_ms"] += (time.time() - t2) * 1000
+                        # LOGIC: WHEN TO SEND TO WORKER?
+                        # 1. If queue is full, skip (don't lag tracker)
+                        if recog_queue.full(): continue
+                        
+                        # 2. If 'Visitor', check cooldown
+                        if p["status"] == "visitor":
+                            if (now - p["last_recog"]) < UNKNOWN_LOCKOUT_TIME: continue
+                            else: p["status"] = "tracking"; p["retries"] = 0 # Retry after 30s
+                        
+                        # 3. If 'Known', check High Conf Cooldown
+                        if p["status"] == "known" and p["conf"] > HIGH_CONFIDENCE_THRESHOLD:
+                             if (now - p["last_recog"]) < RECOGNITION_COOLDOWN: continue
+                        
+                        # 4. If we just checked recently (regardless of result)
+                        if (now - p["last_recog"]) < 1.0: continue
 
-        # 3. Publish Results (Separate from image)
+                    # Push to Queue
+                    recog_queue.put({"id": bid, "frame": rgb, "loc": face_loc})
+
+        # Publish Results for Flask
         with results_lock:
             latest_processed_results["body_boxes"] = body_boxes
             latest_processed_results["active_ids"] = active_ids
-            latest_processed_results["face_boxes"] = last_face_locs
-            latest_processed_results["registry"] = local_registry
+            latest_processed_results["face_boxes"] = curr_faces
 
         print_diagnostics()
 
 # --- MAIN ---
 if __name__ == "__main__":
-    print("--- SYSTEM STARTING ---")
+    print("--- SYSTEM STARTING (ASYNC ARCHITECTURE) ---")
     
-    # 1. Start Video Reader (Runs continuously)
+    # 1. Video Reader
     threading.Thread(target=_frame_reader_loop, args=(CURRENT_STREAM_SOURCE,), daemon=True).start()
     
     # 2. Load Models
     _load_resources()
     
-    # 3. Start AI Thread (Runs at its own pace)
+    # 3. Recognition Worker (The Slow Thread)
+    threading.Thread(target=recognition_worker_thread, daemon=True).start()
+
+    # 4. Tracking Loop (The Fast Thread)
     threading.Thread(target=video_processing_thread, daemon=True).start()
     
-    # 4. Start Flask (Runs at its own pace)
+    # 5. Flask Render
     threading.Thread(target=run_flask, daemon=True).start()
     
     print("--- READY ---")

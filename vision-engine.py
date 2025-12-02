@@ -14,7 +14,7 @@ import logging
 import requests
 import av 
 # --- SILENCE FFMPEG CONSOLE SPAM ---
-av.logging.set_level(av.logging.FATAL) 
+av.logging.set_level(av.logging.PANIC) 
 
 from concurrent.futures import ThreadPoolExecutor
 import torch
@@ -59,7 +59,6 @@ flask_log.setLevel(logging.ERROR)
 
 # --- SETTINGS ---
 STREAM_PI_IP = "100.114.210.58"
-# NOTE: We use TCP now, but with NO BUFFER settings
 STREAM_PI_RTSP = f"rtsp://admin:mysecretpassword@{STREAM_PI_IP}:8554/cam"
 STREAM_WEBCAM = 0
 
@@ -79,8 +78,9 @@ COLOR_TEXT_FG = (255, 255, 255)
 data_lock = threading.Lock()
 output_frame = None
 
-# (Frame, Capture Timestamp)
-latest_raw_packet = (None, 0.0)
+# We use a single-item container for the latest frame to ensure atomicity without complex locking
+# [Frame, Timestamp]
+latest_container = [None, 0.0]
 
 APP_SHOULD_QUIT = False
 VIDEO_THREAD_STARTED = False
@@ -90,13 +90,9 @@ CURRENT_STREAM_SOURCE = STREAM_PI_RTSP
 metrics = {
     "transport": "INIT",
     "latency_pickup": 0,    
-    "time_demux_gap": 0,    
-    "time_decode": 0,      
-    "time_body": 0,
-    "time_face": 0,
-    "time_recog": 0,
+    "fps_read": 0,
     "time_total": 0,
-    "skipped_frames": 0     
+    "dropped_packets": 0     
 }
 
 server_data = {
@@ -181,35 +177,32 @@ def get_ip_addresses():
 def draw_metrics_overlay(frame, metrics):
     overlay = frame.copy()
     h, w = frame.shape[:2]
-    box_w, box_h = 240, 220
+    box_w, box_h = 240, 180
     cv2.rectangle(overlay, (w - box_w, 0), (w, box_h), (0, 0, 0), -1)
     cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
     
     x_start = w - box_w + 10
     y_start = 20
-    line_h = 20
+    line_h = 25
     
-    def val_color(val, low=30, high=60):
-        if val < low: return (0, 255, 0)
-        if val < high: return (0, 255, 255)
-        return (0, 0, 255)
-
-    cv2.putText(frame, f"Transport: {metrics['transport']}", (x_start, y_start), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
+    cv2.putText(frame, f"Transport: {metrics['transport']}", (x_start, y_start), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 1)
     
+    # Pickup Lag
     lag = metrics['latency_pickup']
-    cv2.putText(frame, f"Pickup Lag: {lag:.1f}ms", (x_start, y_start + line_h), cv2.FONT_HERSHEY_SIMPLEX, 0.5, val_color(lag, 50, 100), 1)
+    color = (0, 255, 0) if lag < 100 else (0, 0, 255)
+    cv2.putText(frame, f"Pickup Lag: {lag:.1f}ms", (x_start, y_start + line_h), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 1)
 
-    cv2.putText(frame, f"Drop/Skip: {metrics['skipped_frames']}", (x_start, y_start + line_h*2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+    # Decode FPS
+    fps = metrics['fps_read']
+    cv2.putText(frame, f"Reader FPS: {fps:.1f}", (x_start, y_start + line_h*2), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
 
-    cv2.line(frame, (x_start, y_start + line_h*3), (w, y_start + line_h*3), (100,100,100), 1)
-
-    # Processing Breakdown
-    cv2.putText(frame, f"YOLO Body: {metrics['time_body']:.1f}ms", (x_start, y_start + line_h*4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
-    cv2.putText(frame, f"YOLO Face: {metrics['time_face']:.1f}ms", (x_start, y_start + line_h*5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
-    cv2.putText(frame, f"Recognize: {metrics['time_recog']:.1f}ms", (x_start, y_start + line_h*6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
+    # Skipped Packets
+    dropped = metrics['dropped_packets']
+    cv2.putText(frame, f"Dropped Pkts: {dropped}", (x_start, y_start + line_h*3), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
     
+    # Total
     tot = metrics['time_total']
-    cv2.putText(frame, f"TOTAL: {tot:.1f}ms", (x_start, y_start + line_h*8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, val_color(tot, 50, 150), 2)
+    cv2.putText(frame, f"Proc Time: {tot:.1f}ms", (x_start, y_start + line_h*5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 1)
     return frame
 
 # --- FLASK ---
@@ -250,92 +243,104 @@ def _load_resources():
         except: pass
     load_known_faces(KNOWN_FACES_DIR)
 
-# --- STRICT NO-BUFFER TCP READER ---
+# --- THE SPEED READER ---
 def _frame_reader_loop(source):
-    global latest_raw_packet, data_lock, APP_SHOULD_QUIT, VIDEO_THREAD_STARTED, metrics
+    global latest_container, data_lock, APP_SHOULD_QUIT, VIDEO_THREAD_STARTED, metrics
     
     if isinstance(source, int):
         cap = cv2.VideoCapture(source)
         while not APP_SHOULD_QUIT:
             ret, frame = cap.read()
-            if ret:
-                with data_lock: latest_raw_packet = (frame, time.time())
+            if ret: latest_container[0] = frame; latest_container[1] = time.time()
             else: time.sleep(0.1)
         return
 
-    # Force TCP for stability, but kill buffering for speed
-    proto = 'tcp'
-    metrics['transport'] = "TCP-NOBUF"
+    metrics['transport'] = "TCP-DRAIN"
     
     while not APP_SHOULD_QUIT:
-        logger.info(f"Connecting via {proto.upper()} (No Buffer)...")
+        logger.info(f"Connecting to {source}...")
         container = None
         try:
+            # THE MAGIC FLAGS - These force the OS to drop data rather than buffer it
             container = av.open(source, options={
-                'rtsp_transport': proto,
-                'fflags': 'nobuffer',     # Do not buffer packets
-                'flags': 'low_delay',     # Low delay mode
-                'probesize': '32',        # Fast startup
-                'analyzeduration': '0',   # Fast startup
-                'max_delay': '0',         # STRICTLY ZERO DELAY
-                'reorder_queue_size': '0' # Don't wait for ordering
+                'rtsp_transport': 'tcp',
+                'fflags': 'nobuffer',
+                'flags': 'low_delay',
+                'probesize': '32',
+                'analyzeduration': '0',
+                'buffer_size': '102400', # Restrict OS buffer size 
+                'max_delay': '0',        # Tell FFmpeg to return data NOW
+                'reorder_queue_size': '0'
             })
             
             stream = container.streams.video[0]
             stream.thread_type = 'AUTO'
             
-            logger.info(f"Connected. Streaming...")
+            logger.info(f"Connected. Speed Reader Active.")
             VIDEO_THREAD_STARTED = True
             
-            # Using DEMUX to manually control the flow
+            last_fps_time = time.time()
+            frames_this_sec = 0
+
+            # Direct DEMUX loop
             for packet in container.demux(stream):
                 if APP_SHOULD_QUIT: break
                 
-                if packet.dts is None: continue
-                
-                # Check for corruption flags on the packet before decoding
-                if packet.is_corrupt:
-                    metrics['skipped_frames'] += 1
-                    continue
+                # FPS CALCULATION
+                now = time.time()
+                frames_this_sec += 1
+                if now - last_fps_time >= 1.0:
+                    metrics['fps_read'] = frames_this_sec
+                    frames_this_sec = 0
+                    last_fps_time = now
 
+                # If packet is corrupt, skip
+                if packet.dts is None: continue
+
+                # DECODE STRATEGY: 
+                # Decode everything to keep codec context valid, 
+                # BUT if we get an error, just drop it.
                 try:
                     for frame in packet.decode():
-                        # If frame is incomplete/corrupt, PyAV might tag it
-                        if frame.is_corrupt:
-                            metrics['skipped_frames'] += 1
-                            continue
-
+                        # We convert immediately. 
+                        # This blocks this thread, but ensures we don't build a queue.
                         img = frame.to_ndarray(format='bgr24')
-                        with data_lock:
-                            latest_raw_packet = (img, time.time())
-
-                except av.AVError:
-                    # Silence the error, just count it and move on
-                    metrics['skipped_frames'] += 1
+                        
+                        # ATOMIC UPDATE (No Lock needed for simple replacement)
+                        latest_container[0] = img
+                        latest_container[1] = time.time()
+                        
+                except Exception:
+                    metrics['dropped_packets'] += 1
                     continue
                 
         except Exception as e:
-            logger.error(f"Reader Crash: {e}")
-            time.sleep(1)
+            logger.error(f"Reader Error: {e}")
+            time.sleep(2)
         finally:
             if container: container.close()
 
 # --- PROCESSOR ---
 def video_processing_thread():
-    global data_lock, output_frame, server_data, APP_SHOULD_QUIT, latest_raw_packet, metrics
+    global data_lock, output_frame, server_data, APP_SHOULD_QUIT, latest_container, metrics
     global person_registry, last_face_locations
     
     frame_count = 0
-    while latest_raw_packet[0] is None and not APP_SHOULD_QUIT: time.sleep(0.1)
+    # Wait for first frame
+    while latest_container[0] is None and not APP_SHOULD_QUIT: time.sleep(0.1)
 
     while not APP_SHOULD_QUIT:
         t_start_loop = time.perf_counter()
         
-        with data_lock:
-            frame, capture_ts = latest_raw_packet
+        # 1. GRAB LATEST FRAME (Non-Blocking)
+        frame = latest_container[0]
+        capture_ts = latest_container[1]
         
         if frame is None:
             time.sleep(0.001); continue
+
+        # Detach memory
+        frame = frame.copy()
 
         # Pickup Lag
         metrics['latency_pickup'] = (time.time() - capture_ts) * 1000
@@ -345,11 +350,9 @@ def video_processing_thread():
         if frame is None: continue
         frame_count += 1
         
-        with data_lock:
-            yolo_conf = server_data["yolo_conf"]
+        yolo_conf = server_data["yolo_conf"]
 
         # 3. YOLO BODY
-        t0 = time.perf_counter()
         active_track_ids = []
         body_boxes = {}
         try:
@@ -364,10 +367,8 @@ def video_processing_thread():
                     if track_id not in person_registry:
                         person_registry[track_id] = {"name": "Unknown", "conf": 0.0, "last_seen": time.time()}
         except: pass
-        metrics['time_body'] = (time.perf_counter() - t0) * 1000
 
         # 4. YOLO FACE
-        t0 = time.perf_counter()
         did_face_detect = False
         if frame_count % FACE_RECOGNITION_NTH_FRAME == 0 and yolo_face_model:
             did_face_detect = True
@@ -378,10 +379,8 @@ def video_processing_thread():
                     l, t, r, b = box
                     current_face_locations.append((t, r, b, l))
             last_face_locations = current_face_locations
-        metrics['time_face'] = (time.perf_counter() - t0) * 1000
 
         # 5. RECOGNITION
-        t0 = time.perf_counter()
         if did_face_detect:
             rgb_frame_for_encoding = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             for face_loc in last_face_locations:
@@ -402,7 +401,6 @@ def video_processing_thread():
                     if name != "Unknown":
                         person_registry[body_id]["name"] = name
                         person_registry[body_id]["conf"] = conf
-        metrics['time_recog'] = (time.perf_counter() - t0) * 1000
 
         # 6. DRAWING
         for (ft, fr, fb, fl) in last_face_locations:
@@ -428,7 +426,7 @@ def video_processing_thread():
 # --- MAIN ---
 if __name__ == "__main__":
     print("---------------------------------------------------")
-    print(" VISION ENGINE: STRICT TCP MODE ")
+    print(" VISION ENGINE: FAST DRAIN MODE ")
     print("---------------------------------------------------")
     reader = threading.Thread(target=_frame_reader_loop, args=(CURRENT_STREAM_SOURCE,), daemon=True)
     reader.start()

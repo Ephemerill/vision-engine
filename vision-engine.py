@@ -74,11 +74,9 @@ COLOR_TEXT_FG = (255, 255, 255)
 YOLO_MODELS = {"n": "yolo11n.pt", "s": "yolo11s.pt", "m": "yolo11m.pt", "l": "yolo11l.pt"}
 
 # --- GLOBAL STATE ---
-video_lock = threading.Lock()
 results_lock = threading.Lock()
 registry_lock = threading.Lock()
 
-latest_raw_frame = None       
 latest_processed_results = {  
     "body_boxes": {},
     "active_ids": [],
@@ -187,6 +185,68 @@ def get_ip_addresses():
         return [s.getsockname()[0]]
     except: return []
 
+# --- FAST VIDEO READER CLASS ---
+class FastVideoReader:
+    def __init__(self, source):
+        self.source = source
+        self.frame = None
+        self.lock = threading.Lock()
+        self.running = True
+        self.thread = threading.Thread(target=self._update_loop, daemon=True)
+        self.connected = False
+        
+    def start(self):
+        self.thread.start()
+        return self
+
+    def _update_loop(self):
+        logger.info(f"Connecting to stream: {self.source}")
+        
+        # AGGRESSIVE: Set FFmpeg flags to ignore buffer
+        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay"
+        
+        cap = cv2.VideoCapture(self.source, cv2.CAP_FFMPEG)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1) # Only keep 1 frame in buffer
+        
+        while self.running:
+            if not cap.isOpened():
+                self.connected = False
+                time.sleep(1)
+                cap = cv2.VideoCapture(self.source, cv2.CAP_FFMPEG)
+                continue
+            
+            # BLIND READ: Just read as fast as possible.
+            # If the processing thread is slow, we overwrite 'self.frame' 
+            # effectively dropping old frames.
+            ret, frame = cap.read()
+            
+            if not ret:
+                self.connected = False
+                logger.warning("Stream read error, reconnecting...")
+                cap.release()
+                time.sleep(0.5)
+                continue
+
+            self.connected = True
+            with self.lock:
+                self.frame = frame
+                
+        cap.release()
+
+    def read(self):
+        with self.lock:
+            return self.frame.copy() if self.frame is not None else None
+            
+    def is_connected(self):
+        return self.connected
+        
+    def stop(self):
+        self.running = False
+        self.thread.join()
+
+# Global Stream Instance
+stream_reader = None
+
 # --- FLASK ROUTES ---
 @app.route('/')
 def index():
@@ -195,9 +255,10 @@ def index():
 def generate_frames():
     # --- DECOUPLED RENDERING LOOP ---
     while True:
-        frame = None
-        with video_lock:
-            if latest_raw_frame is not None: frame = latest_raw_frame.copy()
+        if stream_reader is None:
+            time.sleep(0.1); continue
+            
+        frame = stream_reader.read()
         
         if frame is None:
             time.sleep(0.02); continue
@@ -272,62 +333,6 @@ def _load_resources():
         yolo_face_model.to(DEVICE_STR)
     load_known_faces(KNOWN_FACES_DIR)
 
-# --- THREAD 1: VIDEO READER (DYNAMIC LAG-BUSTER) ---
-def _frame_reader_loop(source):
-    global latest_raw_frame, APP_SHOULD_QUIT
-    logger.info(f"Starting Video Reader on: {source}")
-    
-    # Force low latency flags
-    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay"
-    
-    cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
-    while not APP_SHOULD_QUIT:
-        if not cap.isOpened():
-            time.sleep(2)
-            cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
-            continue
-
-        # --- DYNAMIC BUFFER FLUSHING ---
-        # We loop and grab frames. If grabbing is "too fast" (< 15ms), 
-        # it means we are reading from an old buffer. We discard those.
-        # We only stop when grab() takes a realistic amount of time (> 15ms),
-        # which implies we effectively waited for a LIVE frame from the camera.
-        
-        frames_skipped = 0
-        start_time = time.time()
-        
-        # Always grab at least once
-        ret = cap.grab()
-        
-        # If that grab was instant (buffered), keep grabbing until we hit live data
-        while ret and (time.time() - start_time) < 0.015:
-            frames_skipped += 1
-            start_time = time.time() # Reset timer for next grab
-            ret = cap.grab() # Discard old frame
-            
-            # Safety: Don't loop forever if camera is sending 1000fps garbage
-            if frames_skipped > 30: 
-                break 
-
-        if not ret:
-            logger.warning("Stream packet loss")
-            time.sleep(0.1)
-            continue
-            
-        # We have reached the 'live' edge of the stream. Decode THIS frame.
-        ret, frame = cap.retrieve()
-        if ret:
-            with video_lock: 
-                latest_raw_frame = frame
-        
-        # Optional logging to prove it's working
-        if frames_skipped > 0:
-            logger.info(f"Skipped {frames_skipped} old frames to maintain sync.")
-
-    cap.release()
-
 # --- THREAD 2: RECOGNITION WORKER (CPU BOUND) ---
 def recognition_worker_thread():
     global person_registry, perf_stats
@@ -347,7 +352,7 @@ def recognition_worker_thread():
         
         t_start = time.time()
         
-        # 1. ENCODING (The heavy 1.3s part)
+        # 1. ENCODING
         try:
             encs = face_recognition.face_encodings(rgb_frame, [face_loc])
         except Exception as e:
@@ -388,18 +393,26 @@ def recognition_worker_thread():
 
         perf_stats["face_rec_ms"] = (time.time() - t_start) * 1000
 
-# --- THREAD 3: TRACKING LOOP (GPU BOUND - 30 FPS) ---
+# --- THREAD 3: TRACKING LOOP (GPU BOUND) ---
 def video_processing_thread():
     global latest_processed_results, perf_stats, person_registry
     frame_count = 0
     curr_faces = [] 
 
+    # Wait for reader to be ready
+    while stream_reader is None or not stream_reader.is_connected():
+        time.sleep(0.5)
+
+    logger.info("Video Processing Loop Started.")
+
     while not APP_SHOULD_QUIT:
-        frame = None
-        with video_lock:
-            if latest_raw_frame is not None: frame = latest_raw_frame.copy()
+        # AGGRESSIVE: Ask stream reader for the LATEST frame.
+        # It does not care if we missed 5 frames. It just gives us "Now".
+        frame = stream_reader.read()
         
-        if frame is None: time.sleep(0.01); continue
+        if frame is None: 
+            time.sleep(0.01)
+            continue
         
         frame = resize_with_aspect_ratio(frame, max_w=FRAME_WIDTH, max_h=FRAME_HEIGHT)
         frame_count += 1
@@ -480,10 +493,10 @@ def video_processing_thread():
 
 # --- MAIN ---
 if __name__ == "__main__":
-    print("--- SYSTEM STARTING (FRAME SKIPPING MODE) ---")
+    print("--- SYSTEM STARTING (REAL-TIME AGGRESSIVE MODE) ---")
     
-    # 1. Video Reader
-    threading.Thread(target=_frame_reader_loop, args=(CURRENT_STREAM_SOURCE,), daemon=True).start()
+    # 1. Start Fast Stream Reader (Thread-Safe Sink)
+    stream_reader = FastVideoReader(CURRENT_STREAM_SOURCE).start()
     
     # 2. Load Models
     _load_resources()
@@ -505,4 +518,5 @@ if __name__ == "__main__":
         while True: time.sleep(1)
     except KeyboardInterrupt:
         APP_SHOULD_QUIT = True
+        stream_reader.stop()
         print("Stopping...")

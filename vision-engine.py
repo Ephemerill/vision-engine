@@ -56,8 +56,8 @@ flask_log.setLevel(logging.ERROR)
 
 # --- SETTINGS ---
 STREAM_PI_IP = "100.114.210.58"
-STREAM_PI_RTSP = f"rtsp://admin:mysecretpassword@{STREAM_PI_IP}:8554/cam?rtsp_transport=tcp"
-STREAM_PI_HLS = f"http://{STREAM_PI_IP}:8888/cam/index.m3u8"
+# TRY UDP FIRST (Lowest Latency), Fallback to TCP in code
+STREAM_PI_RTSP = f"rtsp://admin:mysecretpassword@{STREAM_PI_IP}:8554/cam"
 STREAM_WEBCAM = 0
 
 FRAME_WIDTH = 640
@@ -71,10 +71,6 @@ COLOR_BODY_KNOWN = (255, 100, 100)
 COLOR_BODY_UNKNOWN = (100, 100, 255) 
 COLOR_FACE_BOX = (255, 255, 0) 
 COLOR_TEXT_FG = (255, 255, 255)
-COLOR_DEBUG_BG = (0, 0, 0)
-
-# Default Body Models (Standard YOLO11)
-YOLO_MODELS = {"n": "yolo11n.pt", "s": "yolo11s.pt", "m": "yolo11m.pt", "l": "yolo11l.pt", "x": "yolo11x.pt"}
 
 # --- GLOBAL STATE ---
 data_lock = threading.Lock()
@@ -89,16 +85,17 @@ CURRENT_STREAM_SOURCE = STREAM_PI_RTSP
 
 # Monitoring Metrics
 metrics = {
-    "fps_read": 0,
-    "fps_proc": 0,
-    "latency_pickup": 0, # Time from Reader -> Processor start
+    "transport": "INIT",
+    "latency_pickup": 0,    # Time fram sat in memory
+    "time_demux_gap": 0,    # Time between packets arriving (Jitter)
+    "time_decode": 0,       # Time to decode packet to numpy
     "time_resize": 0,
     "time_body": 0,
     "time_face": 0,
     "time_recog": 0,
     "time_draw": 0,
     "time_total": 0,
-    "last_reader_update": 0
+    "skipped_frames": 0     # Frames dropped to catch up
 }
 
 server_data = {
@@ -111,6 +108,9 @@ server_data = {
 
 if not GFPGAN_AVAILABLE:
     server_data["face_enhancement_mode"] = "off_disabled"
+
+# Default Body Models
+YOLO_MODELS = {"n": "yolo11n.pt", "s": "yolo11s.pt", "m": "yolo11m.pt", "l": "yolo11l.pt", "x": "yolo11x.pt"}
 
 # --- RESOURCES ---
 known_face_encodings = []
@@ -125,14 +125,12 @@ gfpgan_enhancer = None
 
 # --- HELPER FUNCTIONS ---
 def get_face_model_path():
-    if os.path.exists(FACE_MODEL_NAME):
-        return FACE_MODEL_NAME
-    logger.info(f"Downloading New Face Model ({FACE_MODEL_NAME})...")
+    if os.path.exists(FACE_MODEL_NAME): return FACE_MODEL_NAME
+    logger.info(f"Downloading Face Model...")
     try:
-        response = requests.get(FACE_MODEL_URL, stream=True)
-        if response.status_code != 200: return None
+        r = requests.get(FACE_MODEL_URL, stream=True)
         with open(FACE_MODEL_NAME, 'wb') as f:
-            for chunk in response.iter_content(chunk_size=8192): f.write(chunk)
+            for chunk in r.iter_content(chunk_size=8192): f.write(chunk)
         return FACE_MODEL_NAME
     except: return None
 
@@ -153,9 +151,8 @@ def load_known_faces(known_faces_dir):
         if not os.path.isdir(person_dir) or person_name.startswith('.'): continue
         for filename in os.listdir(person_dir):
             if filename.lower().endswith((".jpg", ".png", ".jpeg")):
-                image_path = os.path.join(person_dir, filename)
                 try:
-                    img = face_recognition.load_image_file(image_path)
+                    img = face_recognition.load_image_file(os.path.join(person_dir, filename))
                     encs = face_recognition.face_encodings(img)
                     if encs:
                         known_face_encodings.append(encs[0])
@@ -181,185 +178,183 @@ def get_ip_addresses():
     return list(set(ips))
 
 def draw_metrics_overlay(frame, metrics):
-    """Draws a semi-transparent debug box with timing stats."""
     overlay = frame.copy()
     h, w = frame.shape[:2]
-    
-    # Stats Box
-    box_w, box_h = 220, 240
+    box_w, box_h = 240, 270
     cv2.rectangle(overlay, (w - box_w, 0), (w, box_h), (0, 0, 0), -1)
-    alpha = 0.6
-    cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
+    cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
     
     x_start = w - box_w + 10
     y_start = 20
     line_h = 20
     
-    def draw_line(text, val, limit=50, y_pos=0):
-        color = (0, 255, 0)
-        if val > limit: color = (0, 165, 255) # Orange
-        if val > limit * 2: color = (0, 0, 255) # Red
-        cv2.putText(frame, f"{text}: {val:.1f}ms", (x_start, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+    def val_color(val, low=30, high=60):
+        if val < low: return (0, 255, 0)
+        if val < high: return (0, 255, 255)
+        return (0, 0, 255)
 
-    # 1. Pickup Lag (How old is the frame before we start?)
-    draw_line("Pickup Lag", metrics['latency_pickup'], 50, y_start)
+    cv2.putText(frame, f"Transport: {metrics['transport']}", (x_start, y_start), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
     
-    # 2. Resize
-    draw_line("Resize", metrics['time_resize'], 10, y_start + line_h)
-    
-    # 3. Body
-    draw_line("YOLO Body", metrics['time_body'], 30, y_start + line_h*2)
-    
-    # 4. Face
-    draw_line("YOLO Face", metrics['time_face'], 30, y_start + line_h*3)
-    
-    # 5. Recog
-    draw_line("Face Recog", metrics['time_recog'], 100, y_start + line_h*4)
-    
-    # 6. Draw
-    draw_line("Draw", metrics['time_draw'], 5, y_start + line_h*5)
-    
-    # 7. Total
-    draw_line("TOTAL PROC", metrics['time_total'], 100, y_start + line_h*6)
-    
-    # 8. Time since last reader update
-    curr_time = time.time()
-    last_read = metrics['last_reader_update']
-    time_since_read = (curr_time - last_read) * 1000 if last_read > 0 else 0
-    draw_line("Read Age", time_since_read, 60, y_start + line_h*8)
+    # Packet Jitter (Are packets arriving smoothly?)
+    jit = metrics['time_demux_gap']
+    cv2.putText(frame, f"Pkt Jitter: {jit:.1f}ms", (x_start, y_start + line_h), cv2.FONT_HERSHEY_SIMPLEX, 0.5, val_color(jit, 40, 100), 1)
 
+    # Decode Time
+    dec = metrics['time_decode']
+    cv2.putText(frame, f"Decoder: {dec:.1f}ms", (x_start, y_start + line_h*2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, val_color(dec, 15, 30), 1)
+
+    # Pickup Lag
+    lag = metrics['latency_pickup']
+    cv2.putText(frame, f"Pickup Lag: {lag:.1f}ms", (x_start, y_start + line_h*3), cv2.FONT_HERSHEY_SIMPLEX, 0.5, val_color(lag, 50, 100), 1)
+
+    # Skipped
+    cv2.putText(frame, f"Drop/Skip: {metrics['skipped_frames']}", (x_start, y_start + line_h*4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+
+    cv2.line(frame, (x_start, y_start + line_h*5), (w, y_start + line_h*5), (100,100,100), 1)
+
+    # Processing Breakdown
+    cv2.putText(frame, f"YOLO Body: {metrics['time_body']:.1f}ms", (x_start, y_start + line_h*6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
+    cv2.putText(frame, f"YOLO Face: {metrics['time_face']:.1f}ms", (x_start, y_start + line_h*7), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
+    cv2.putText(frame, f"Recognize: {metrics['time_recog']:.1f}ms", (x_start, y_start + line_h*8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
+    
+    tot = metrics['time_total']
+    cv2.putText(frame, f"TOTAL: {tot:.1f}ms", (x_start, y_start + line_h*10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, val_color(tot, 50, 150), 2)
     return frame
 
-# --- FLASK ROUTES ---
+# --- FLASK ---
 @app.route('/')
-def index():
-    return "<html><body style='background:black; text-align:center;'><h1 style='color:white;'>Vision Monitor</h1><img src='/video_feed' style='width:90%; border:2px solid #333;'></body></html>"
+def index(): return "<html><body style='background:black; text-align:center;'><img src='/video_feed' style='width:90%; border:2px solid #333;'></body></html>"
 
 def generate_frames():
     while True:
         with data_lock:
-            if output_frame is None:
-                time.sleep(0.05); continue
+            if output_frame is None: time.sleep(0.05); continue
             (flag, encodedImage) = cv2.imencode(".jpg", output_frame)
-            if not flag: continue
         yield(b'--frame\r\n' b'Content-Type: image/jpeg\r\n\r\n' + bytearray(encodedImage) + b'\r\n')
 
 @app.route('/video_feed')
-def video_feed():
-    return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+def video_feed(): return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
-def run_flask():
-    try:
-        app.run(host='0.0.0.0', port=WEB_SERVER_PORT, debug=False, use_reloader=False)
-    except: pass
+def run_flask(): app.run(host='0.0.0.0', port=WEB_SERVER_PORT, debug=False, use_reloader=False)
 
-# --- RESOURCE LOADING ---
+# --- RESOURCES ---
 def _load_resources():
     global GFPGANer, GFPGAN_AVAILABLE, yolo_body_model, yolo_face_model, gfpgan_enhancer
     
-    logger.info("Loading GFPGAN...")
-    try:
-        from gfpgan import GFPGANer as G; GFPGANer = G
-        GFPGAN_AVAILABLE = True
+    try: from gfpgan import GFPGANer as G; GFPGANer = G; GFPGAN_AVAILABLE = True
     except: GFPGAN_AVAILABLE = False
 
-    logger.info("Loading YOLO11 Body Model (GPU)...")
+    logger.info("Loading YOLO11 Body Model...")
     yolo_body_model = YOLO(YOLO_MODELS[server_data['yolo_model_key']], verbose=False)
     yolo_body_model.to(DEVICE_STR) 
 
     face_path = get_face_model_path()
     if face_path:
-        logger.info(f"Loading Face Model: {face_path} (GPU)...")
+        logger.info(f"Loading Face Model...")
         yolo_face_model = YOLO(face_path, verbose=False)
         yolo_face_model.to(DEVICE_STR)
 
     if GFPGAN_AVAILABLE:
-        try:
-            gfpgan_enhancer = GFPGANer(model_path='https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.3.pth', upscale=2, arch='clean', channel_multiplier=2, bg_upsampler=None, device=DEVICE_STR)
-        except: 
-            with data_lock: server_data["face_enhancement_mode"] = "off_disabled"
-
+        try: gfpgan_enhancer = GFPGANer(model_path='https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.3.pth', upscale=2, arch='clean', channel_multiplier=2, bg_upsampler=None, device=DEVICE_STR)
+        except: pass
     load_known_faces(KNOWN_FACES_DIR)
 
-# --- PYAV VIDEO THREAD ---
+# --- LOW LATENCY READER ---
 def _frame_reader_loop(source):
     global latest_raw_packet, data_lock, APP_SHOULD_QUIT, VIDEO_THREAD_STARTED, metrics
-    
-    logger.info(f"Starting PyAV Stream Reader on: {source}")
     
     if isinstance(source, int):
         cap = cv2.VideoCapture(source)
         while not APP_SHOULD_QUIT:
             ret, frame = cap.read()
             if ret:
-                with data_lock: 
-                    latest_raw_packet = (frame, time.time())
-                    metrics["last_reader_update"] = time.time()
-                VIDEO_THREAD_STARTED = True
-            else:
-                time.sleep(0.1)
-        cap.release()
+                with data_lock: latest_raw_packet = (frame, time.time())
+            else: time.sleep(0.1)
         return
 
+    # RETRY LOGIC for Protocol
+    protocols = ['udp', 'tcp'] # Try UDP first for speed
+    current_proto_idx = 0
+    
     while not APP_SHOULD_QUIT:
+        proto = protocols[current_proto_idx]
+        metrics['transport'] = proto.upper()
+        logger.info(f"Connecting via {proto.upper()}...")
+        
+        container = None
         try:
-            # Aggressive Low Latency Options
             container = av.open(source, options={
-                'rtsp_transport': 'tcp',
+                'rtsp_transport': proto,
                 'fflags': 'nobuffer',
                 'flags': 'low_delay',
-                'analyzeduration': '0', # Disable stream analysis for speed
-                'probesize': '32',      # Minimum probe size
-                'reorder_queue_size': '0' # Disable reordering
+                'probesize': '32',
+                'analyzeduration': '0',
+                'max_delay': '500000', # 0.5s max buffer
+                'reorder_queue_size': '0'
             })
-            
             stream = container.streams.video[0]
             stream.thread_type = 'AUTO'
             
-            logger.info("PyAV Connected. Reading packets...")
+            logger.info(f"Connected ({proto}). Streaming...")
             VIDEO_THREAD_STARTED = True
-
-            for frame in container.decode(stream):
+            
+            last_pkt_time = time.time()
+            
+            # DEMUX LOOP (Separate from Decode)
+            for packet in container.demux(stream):
                 if APP_SHOULD_QUIT: break
                 
-                img = frame.to_ndarray(format='bgr24')
+                # Jitter Monitor
                 now = time.time()
+                metrics['time_demux_gap'] = (now - last_pkt_time) * 1000
+                last_pkt_time = now
                 
-                with data_lock:
-                    latest_raw_packet = (img, now)
-                    metrics["last_reader_update"] = now
+                # Decode
+                if packet.dts is None: continue
                 
+                # Monitor Decode Time
+                t_dec_start = time.perf_counter()
+                frames = packet.decode()
+                
+                for frame in frames:
+                    # Convert to numpy
+                    img = frame.to_ndarray(format='bgr24')
+                    t_dec_end = time.perf_counter()
+                    metrics['time_decode'] = (t_dec_end - t_dec_start) * 1000
+                    
+                    with data_lock:
+                        latest_raw_packet = (img, time.time())
+                
+        except av.AVError as e:
+            logger.error(f"Stream Error ({proto}): {e}")
+            # Switch protocol on error
+            current_proto_idx = (current_proto_idx + 1) % len(protocols)
+            time.sleep(1)
         except Exception as e:
-            logger.error(f"Stream Error: {e}")
-            time.sleep(2)
+            logger.error(f"Reader Crash: {e}")
+            time.sleep(1)
         finally:
-            try: container.close()
-            except: pass
+            if container: container.close()
 
+# --- PROCESSOR ---
 def video_processing_thread():
     global data_lock, output_frame, server_data, APP_SHOULD_QUIT, latest_raw_packet, metrics
     global person_registry, last_face_locations
     
     frame_count = 0
-    
-    while latest_raw_packet[0] is None and not APP_SHOULD_QUIT:
-        time.sleep(0.1)
+    while latest_raw_packet[0] is None and not APP_SHOULD_QUIT: time.sleep(0.1)
 
     while not APP_SHOULD_QUIT:
         t_start_loop = time.perf_counter()
         
-        # 1. ACQUIRE FRAME & CALC LAG
         with data_lock:
             frame, capture_ts = latest_raw_packet
-            
-        if frame is None:
-            time.sleep(0.005); continue
-
-        # Calculate how old this frame is right now
-        pickup_lag = (time.time() - capture_ts) * 1000
-        metrics['latency_pickup'] = pickup_lag
         
-        frame = frame.copy() # Detach from global
+        if frame is None:
+            time.sleep(0.001); continue
+
+        # Pickup Lag
+        metrics['latency_pickup'] = (time.time() - capture_ts) * 1000
         
         # 2. RESIZE
         t0 = time.perf_counter()
@@ -369,7 +364,6 @@ def video_processing_thread():
         frame_count += 1
         
         with data_lock:
-            enhancement_mode = server_data["face_enhancement_mode"]
             yolo_conf = server_data["yolo_conf"]
 
         # 3. YOLO BODY
@@ -387,7 +381,7 @@ def video_processing_thread():
                     active_track_ids.append(track_id)
                     if track_id not in person_registry:
                         person_registry[track_id] = {"name": "Unknown", "conf": 0.0, "last_seen": time.time()}
-        except Exception: pass
+        except: pass
         metrics['time_body'] = (time.perf_counter() - t0) * 1000
 
         # 4. YOLO FACE
@@ -411,7 +405,6 @@ def video_processing_thread():
             for face_loc in last_face_locations:
                 body_id = get_containing_body_box(face_loc, body_boxes)
                 if body_id is not None:
-                    # Logic for GFPGAN or Normal Rec
                     encoding_loc = [face_loc]
                     face_enc = face_recognition.face_encodings(rgb_frame_for_encoding, encoding_loc)
                     
@@ -440,18 +433,11 @@ def video_processing_thread():
             data = person_registry.get(track_id, {"name": "Unknown", "conf": 0})
             name = data["name"]; conf = data["conf"]
             color = COLOR_BODY_KNOWN if name != "Unknown" else COLOR_BODY_UNKNOWN
-            
             cv2.rectangle(frame, (l, t), (r, b), color, 2)
-            label = f"{track_id}: {name}"
-            if name != "Unknown": label += f" ({int(conf)}%)"
-            
-            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-            cv2.rectangle(frame, (l, t - 25), (l + tw + 10, t), color, -1)
-            cv2.putText(frame, label, (l + 5, t - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLOR_TEXT_FG, 2)
+            cv2.putText(frame, f"{track_id}:{name}", (l, t - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
             live_face_payload.append({"name": name, "confidence": conf})
         metrics['time_draw'] = (time.perf_counter() - t0) * 1000
         
-        # 7. TOTAL & OVERLAY
         metrics['time_total'] = (time.perf_counter() - t_start_loop) * 1000
         frame = draw_metrics_overlay(frame, metrics)
 
@@ -462,35 +448,16 @@ def video_processing_thread():
 # --- MAIN ---
 if __name__ == "__main__":
     print("---------------------------------------------------")
-    print(" VISION ENGINE: DEBUG/MONITOR MODE ")
+    print(" VISION ENGINE: LOW LATENCY MODE ")
     print("---------------------------------------------------")
-    
     reader = threading.Thread(target=_frame_reader_loop, args=(CURRENT_STREAM_SOURCE,), daemon=True)
     reader.start()
-    
     _load_resources()
-    
     proc = threading.Thread(target=video_processing_thread, daemon=True)
     proc.start()
-    
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
-    
-    print("---------------------------------------------------")
-    print(" SYSTEM READY ")
-    print(f" View Live Feed at:")
-    
-    ips = get_ip_addresses()
-    for ip in ips:
-        print(f" -> http://{ip}:{WEB_SERVER_PORT}/")
-    print("---------------------------------------------------")
-    
+    print(f" -> http://{get_ip_addresses()[0]}:{WEB_SERVER_PORT}/")
     try:
-        while True:
-            time.sleep(5)
-            # Log metrics to console occasionally
-            m = metrics
-            print(f"[STATS] Pickup Lag: {m['latency_pickup']:.1f}ms | Proc: {m['time_total']:.1f}ms | Body: {m['time_body']:.1f}ms")
-    except KeyboardInterrupt:
-        APP_SHOULD_QUIT = True
-        print("\nShutting down...")
+        while True: time.sleep(10)
+    except KeyboardInterrupt: APP_SHOULD_QUIT = True

@@ -7,14 +7,9 @@ import cv2
 import face_recognition 
 import os
 import numpy as np
-import ollama
 import threading
 import time
 import sys
-import subprocess 
-import base64
-import traceback
-import socket
 import logging
 import requests
 from concurrent.futures import ThreadPoolExecutor
@@ -60,7 +55,7 @@ MODEL_GEMMA = 'gemma3:4b'
 MODEL_OFF = 'off'
 
 STREAM_PI_IP = "100.114.210.58"
-STREAM_PI_RTSP = f"rtsp://admin:mysecretpassword@{STREAM_PI_IP}:8554/cam?rtsp_transport=tcp"
+STREAM_PI_RTSP = f"rtsp://admin:mysecretpassword@{STREAM_PI_IP}:8554/cam" # Force TCP via code, not URL params
 STREAM_PI_HLS = f"http://{STREAM_PI_IP}:8888/cam/index.m3u8"
 STREAM_WEBCAM = 0
 
@@ -69,6 +64,7 @@ FRAME_HEIGHT = 480
 KNOWN_FACES_DIR = "known_faces"
 FACE_CONFIDENCE_THRESH = 0.5 
 FACE_RECOGNITION_NTH_FRAME = 3 
+BOX_PADDING = 10
 
 COLOR_BODY_KNOWN = (255, 100, 100) 
 COLOR_BODY_UNKNOWN = (100, 100, 255) 
@@ -81,7 +77,11 @@ YOLO_MODELS = {"n": "yolo11n.pt", "s": "yolo11s.pt", "m": "yolo11m.pt", "l": "yo
 # --- GLOBAL STATE ---
 data_lock = threading.Lock()
 output_frame = None
-latest_raw_frame = None 
+
+# OPTIMIZATION: "Atomic Packet" [Frame, Timestamp]
+# We use this instead of a queue to ensure we only ever have the absolute latest frame
+latest_packet = [None, 0.0] 
+
 APP_SHOULD_QUIT = False
 VIDEO_THREAD_STARTED = False
 CURRENT_STREAM_SOURCE = STREAM_PI_RTSP 
@@ -177,6 +177,37 @@ def get_ip_addresses():
     except: pass
     return list(set(ips))
 
+def draw_perf_overlay(frame, timings, lag_ms):
+    """Draws small performance metrics in top left."""
+    x, y = 10, 15
+    line_h = 12
+    font_scale = 0.4
+    color = (0, 255, 0)
+    
+    # Draw Background Box for readability
+    cv2.rectangle(frame, (0, 0), (140, 120), (0, 0, 0), -1)
+    
+    # 1. Real-Time Lag
+    lag_color = (0, 255, 0) if lag_ms < 200 else (0, 165, 255)
+    if lag_ms > 1000: lag_color = (0, 0, 255)
+    cv2.putText(frame, f"LAG: {lag_ms:.0f} ms", (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, lag_color, 1)
+    y += 18
+    
+    # 2. Individual Timings
+    cv2.putText(frame, f"Total Proc: {timings['total']:.1f}ms", (x, y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, 1)
+    y += line_h
+    cv2.putText(frame, "----------------", (x, y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (100,100,100), 1)
+    y += line_h
+    
+    keys = ["resize", "body", "face", "recog", "enhance", "draw"]
+    for k in keys:
+        if k in timings:
+            val = timings[k]
+            cv2.putText(frame, f"{k.title()}: {val:.1f}ms", (x, y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (200,200,200), 1)
+            y += line_h
+            
+    return frame
+
 # --- FLASK ROUTES ---
 @app.route('/')
 def index():
@@ -186,7 +217,7 @@ def generate_frames():
     while True:
         with data_lock:
             if output_frame is None:
-                time.sleep(0.1); continue
+                time.sleep(0.01); continue
             (flag, encodedImage) = cv2.imencode(".jpg", output_frame)
             if not flag: continue
         yield(b'--frame\r\n' b'Content-Type: image/jpeg\r\n\r\n' + bytearray(encodedImage) + b'\r\n')
@@ -235,49 +266,69 @@ def _load_resources():
 
     load_known_faces(KNOWN_FACES_DIR)
 
-# --- VIDEO THREADS ---
+# --- SPEED READER THREAD ---
 def _frame_reader_loop(source):
-    global latest_raw_frame, data_lock, APP_SHOULD_QUIT, VIDEO_THREAD_STARTED, CURRENT_STREAM_SOURCE
-    cap = None
+    global latest_packet, data_lock, APP_SHOULD_QUIT, VIDEO_THREAD_STARTED, CURRENT_STREAM_SOURCE
     
-    def connect(src):
-        if isinstance(src, int): return cv2.VideoCapture(src)
-        return cv2.VideoCapture(src, cv2.CAP_FFMPEG) 
-
-    logger.info(f"Starting Video Reader on: {source}")
+    # CRITICAL: Set FFmpeg flags to ignore buffer.
+    # This makes OpenCV act like the Low Latency PyAV code from before.
+    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay"
+    
+    logger.info(f"Starting Speed Reader on: {source}")
+    
+    cap = None
     while not APP_SHOULD_QUIT:
         if cap is None or not cap.isOpened():
-            cap = connect(source)
-            if not cap.isOpened() and source == STREAM_PI_RTSP:
-                logger.warning("RTSP Failed. Switching to HLS Fallback.")
-                source = STREAM_PI_HLS; CURRENT_STREAM_SOURCE = STREAM_PI_HLS; continue
+            if isinstance(source, int): cap = cv2.VideoCapture(source)
+            else: cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
+            
             if cap.isOpened():
-                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1); VIDEO_THREAD_STARTED = True
-                logger.info("Video Stream Connected.")
-            else: 
+                VIDEO_THREAD_STARTED = True
+                logger.info("✅ Stream Connected (Low Latency Mode)")
+            else:
                 time.sleep(2); continue
 
         ret, frame = cap.read()
         if not ret: 
             logger.warning("Frame dropped. Reconnecting...")
-            cap.release(); time.sleep(0.5); continue
-        with data_lock: latest_raw_frame = frame
+            cap.release(); cap = None; time.sleep(0.5); continue
+        
+        # ATOMIC OVERWRITE - Drop old frames, keep only the newest
+        with data_lock: 
+            latest_packet[0] = frame
+            latest_packet[1] = time.time() # Stamp arrival time
+            
     if cap: cap.release()
 
+# --- PROCESSING THREAD (With Monitoring) ---
 def video_processing_thread():
-    global data_lock, output_frame, server_data, APP_SHOULD_QUIT, latest_raw_frame
+    global data_lock, output_frame, server_data, APP_SHOULD_QUIT, latest_packet
     global person_registry, last_face_locations
     
     frame_count = 0
     executor = ThreadPoolExecutor(max_workers=8) 
 
     while not APP_SHOULD_QUIT:
+        t_start_proc = time.perf_counter()
+        timings = {}
+        
+        # 1. ACQUIRE (Non-blocking check)
         frame = None
+        capture_ts = 0
         with data_lock:
-            if latest_raw_frame is not None: frame = latest_raw_frame.copy()
-        if frame is None: time.sleep(0.01); continue
+            if latest_packet[0] is not None: 
+                frame = latest_packet[0].copy()
+                capture_ts = latest_packet[1]
+        
+        if frame is None: time.sleep(0.005); continue
 
+        # CALC REAL-TIME LAG
+        lag_ms = (time.time() - capture_ts) * 1000
+
+        # 2. RESIZE
+        t0 = time.perf_counter()
         frame = resize_with_aspect_ratio(frame, max_w=FRAME_WIDTH, max_h=FRAME_HEIGHT)
+        timings['resize'] = (time.perf_counter() - t0) * 1000
         if frame is None: continue
         frame_count += 1
         
@@ -285,7 +336,8 @@ def video_processing_thread():
             enhancement_mode = server_data["face_enhancement_mode"]
             yolo_conf = server_data["yolo_conf"]
 
-        # 1. YOLO Body Tracking (YOLO11 - GPU)
+        # 3. YOLO BODY
+        t0 = time.perf_counter()
         body_results = yolo_body_model.track(frame, persist=True, classes=[0], conf=yolo_conf, verbose=False)
         body_boxes = {}; active_track_ids = []
         
@@ -298,8 +350,10 @@ def video_processing_thread():
                 active_track_ids.append(track_id)
                 if track_id not in person_registry:
                     person_registry[track_id] = {"name": "Unknown", "conf": 0.0, "last_seen": time.time()}
+        timings['body'] = (time.perf_counter() - t0) * 1000
 
-        # 2. YOLO Face Detection (YOLOv11 Face - GPU)
+        # 4. YOLO FACE
+        t0 = time.perf_counter()
         if frame_count % FACE_RECOGNITION_NTH_FRAME == 0 and yolo_face_model:
             face_results = yolo_face_model.predict(frame, conf=FACE_CONFIDENCE_THRESH, verbose=False)
             
@@ -307,19 +361,25 @@ def video_processing_thread():
             if len(face_results) > 0:
                 for box in face_results[0].boxes.xyxy.cpu().numpy().astype(int):
                     l, t, r, b = box
-                    current_face_locations.append((t, r, b, l)) # Top, Right, Bottom, Left
+                    current_face_locations.append((t, r, b, l))
             
             last_face_locations = current_face_locations
+        timings['face'] = (time.perf_counter() - t0) * 1000
 
-            # 3. Recognition (Dlib CPU)
+        # 5. RECOGNITION & ENHANCE
+        t0 = time.perf_counter()
+        if frame_count % FACE_RECOGNITION_NTH_FRAME == 0:
             rgb_frame_for_encoding = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             
-            for face_loc in current_face_locations:
+            for face_loc in last_face_locations:
                 body_id = get_containing_body_box(face_loc, body_boxes)
                 if body_id is not None:
                     top, right, bottom, left = face_loc
                     
                     input_image_encoding = rgb_frame_for_encoding
+                    
+                    # GFPGAN Logic
+                    t_enhance = time.perf_counter()
                     if GFPGAN_AVAILABLE and enhancement_mode == "on" and gfpgan_enhancer:
                          t_pad = max(0, top - BOX_PADDING); b_pad = min(frame.shape[0], bottom + BOX_PADDING)
                          l_pad = max(0, left - BOX_PADDING); r_pad = min(frame.shape[1], right + BOX_PADDING)
@@ -331,11 +391,13 @@ def video_processing_thread():
                              if restored_face is not None:
                                  input_image_encoding = cv2.cvtColor(restored_face, cv2.COLOR_BGR2RGB)
                                  encoding_loc = [(0, input_image_encoding.shape[1], input_image_encoding.shape[0], 0)]
-                         except:
-                             encoding_loc = [face_loc] 
+                             else: encoding_loc = [face_loc]
+                         except: encoding_loc = [face_loc]
                     else:
                         encoding_loc = [face_loc]
+                    timings['enhance'] = (time.perf_counter() - t_enhance) * 1000
 
+                    # Recognition
                     face_enc = face_recognition.face_encodings(input_image_encoding, encoding_loc)
                     
                     name = "Unknown"; conf = 0.0
@@ -351,8 +413,10 @@ def video_processing_thread():
                         person_registry[body_id]["name"] = name
                         person_registry[body_id]["conf"] = conf
                     person_registry[body_id]["last_seen"] = time.time()
+        timings['recog'] = (time.perf_counter() - t0) * 1000
 
-        # 4. Drawing
+        # 6. DRAWING
+        t0 = time.perf_counter()
         for (ft, fr, fb, fl) in last_face_locations:
             cv2.rectangle(frame, (fl, ft), (fr, fb), COLOR_FACE_BOX, 2)
 
@@ -371,6 +435,13 @@ def video_processing_thread():
             cv2.rectangle(frame, (l, t - 25), (l + tw + 10, t), color, -1)
             cv2.putText(frame, label, (l + 5, t - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLOR_TEXT_FG, 2)
             live_face_payload.append({"name": name, "confidence": conf})
+        timings['draw'] = (time.perf_counter() - t0) * 1000
+        
+        # TOTAL TIME
+        timings['total'] = (time.perf_counter() - t_start_proc) * 1000
+        
+        # RENDER DEBUG OVERLAY
+        frame = draw_perf_overlay(frame, timings, lag_ms)
 
         with data_lock:
             output_frame = frame
@@ -379,7 +450,7 @@ def video_processing_thread():
 # --- MAIN ---
 if __name__ == "__main__":
     print("---------------------------------------------------")
-    print(" HEADLESS VISION ENGINE STARTING ")
+    print(" VISION ENGINE STARTING ")
     print("---------------------------------------------------")
     
     reader = threading.Thread(target=_frame_reader_loop, args=(CURRENT_STREAM_SOURCE,), daemon=True)
@@ -413,4 +484,4 @@ if __name__ == "__main__":
                 print(".", end="", flush=True)
     except KeyboardInterrupt:
         APP_SHOULD_QUIT = True
-        print("\nShutting down...")
+        print("\nShutting down...")f

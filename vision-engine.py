@@ -7,19 +7,20 @@ import cv2
 import face_recognition 
 import os
 import numpy as np
+import ollama
 import threading
 import time
 import sys
 import subprocess 
+import base64
 import traceback
 import socket
 import logging
 import requests
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 import torch
 from flask import Flask, Response
 from ultralytics import YOLO
-from collections import deque
 
 # --- CONFIGURATION ---
 RECOGNITION_TOLERANCE = 0.5 
@@ -36,11 +37,8 @@ logger = logging.getLogger("VisionEngine")
 # --- HARDWARE CHECK ---
 if torch.cuda.is_available():
     DEVICE_STR = 'cuda:0'
-    try:
-        gpu_name = torch.cuda.get_device_name(0)
-        logger.info(f"✅ GPU DETECTED: {gpu_name}")
-    except:
-        logger.info("✅ GPU detected (name unknown).")
+    gpu_name = torch.cuda.get_device_name(0)
+    logger.info(f"✅ GPU DETECTED: {gpu_name}")
 else:
     DEVICE_STR = 'cpu'
     logger.warning("⚠️  CRITICAL: GPU NOT DETECTED. Running on CPU.")
@@ -71,7 +69,6 @@ FRAME_HEIGHT = 480
 KNOWN_FACES_DIR = "known_faces"
 FACE_CONFIDENCE_THRESH = 0.5 
 FACE_RECOGNITION_NTH_FRAME = 3 
-TARGET_FPS = 20  # asked from ffmpeg (-r 20)
 
 COLOR_BODY_KNOWN = (255, 100, 100) 
 COLOR_BODY_UNKNOWN = (100, 100, 255) 
@@ -85,7 +82,6 @@ YOLO_MODELS = {"n": "yolo11n.pt", "s": "yolo11s.pt", "m": "yolo11m.pt", "l": "yo
 data_lock = threading.Lock()
 output_frame = None
 latest_raw_frame = None 
-latest_raw_frame_ts = 0.0
 APP_SHOULD_QUIT = False
 VIDEO_THREAD_STARTED = False
 CURRENT_STREAM_SOURCE = STREAM_PI_RTSP 
@@ -112,14 +108,6 @@ yolo_body_model = None
 yolo_face_model = None
 gfpgan_enhancer = None
 
-# Small helper to check ffmpeg presence
-def ffmpeg_exists():
-    try:
-        subprocess.check_output(["ffmpeg", "-version"])
-        return True
-    except Exception:
-        return False
-
 # --- HELPER FUNCTIONS ---
 def get_face_model_path():
     if os.path.exists(FACE_MODEL_NAME):
@@ -127,7 +115,7 @@ def get_face_model_path():
         
     logger.info(f"Downloading New Face Model ({FACE_MODEL_NAME})...")
     try:
-        response = requests.get(FACE_MODEL_URL, stream=True, timeout=30)
+        response = requests.get(FACE_MODEL_URL, stream=True)
         if response.status_code != 200:
             logger.error(f"Download failed: Status {response.status_code}")
             return None
@@ -151,9 +139,7 @@ def resize_with_aspect_ratio(frame, max_w=640, max_h=480):
 
 def load_known_faces(known_faces_dir):
     global known_face_encodings, known_face_names
-    if not os.path.exists(known_faces_dir): 
-        logger.info("No known_faces directory found.")
-        return
+    if not os.path.exists(known_faces_dir): return
     
     known_face_encodings.clear(); known_face_names.clear()
     logger.info(f"Loading faces from {known_faces_dir}...")
@@ -166,13 +152,12 @@ def load_known_faces(known_faces_dir):
                 image_path = os.path.join(person_dir, filename)
                 try:
                     img = face_recognition.load_image_file(image_path)
-                    encs = face_recognition.face_encodings(img, model='small')
+                    encs = face_recognition.face_encodings(img)
                     if encs:
                         known_face_encodings.append(encs[0])
                         known_face_names.append(person_name)
                         count += 1
-                except Exception as e:
-                    logger.warning(f"Failed encoding {image_path}: {e}")
+                except: pass
     logger.info(f"Loaded {count} known face identities.")
 
 def get_containing_body_box(face_box, body_boxes):
@@ -198,21 +183,13 @@ def index():
     return "<html><body style='background:black; text-align:center;'><h1 style='color:white;'>Vision Engine Live</h1><img src='/video_feed' style='width:90%; border:2px solid #333;'></body></html>"
 
 def generate_frames():
-    global output_frame
-    # Serve the latest frame; don't block waiting on old frames
-    while not APP_SHOULD_QUIT:
+    while True:
         with data_lock:
-            frame = output_frame.copy() if output_frame is not None else None
-        if frame is None:
-            time.sleep(0.01)
-            continue
-        # Lower JPEG quality for faster encoding (change if you want better quality)
-        encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 70]
-        (flag, encodedImage) = cv2.imencode(".jpg", frame, encode_param)
-        if not flag:
-            continue
+            if output_frame is None:
+                time.sleep(0.1); continue
+            (flag, encodedImage) = cv2.imencode(".jpg", output_frame)
+            if not flag: continue
         yield(b'--frame\r\n' b'Content-Type: image/jpeg\r\n\r\n' + bytearray(encodedImage) + b'\r\n')
-    # End generator on quit
 
 @app.route('/video_feed')
 def video_feed():
@@ -235,20 +212,16 @@ def _load_resources():
     except: GFPGAN_AVAILABLE = False
 
     # 1. Body Tracking (Standard YOLO11)
-    logger.info("Loading YOLO11 Body Model (GPU/CPU)...")
+    logger.info("Loading YOLO11 Body Model (GPU)...")
     yolo_body_model = YOLO(YOLO_MODELS[server_data['yolo_model_key']], verbose=False)
-    try:
-        yolo_body_model.to(DEVICE_STR)
-    except: pass
+    yolo_body_model.to(DEVICE_STR) 
 
     # 2. Face Detection (YOLOv11-Face)
     face_path = get_face_model_path()
     if face_path:
-        logger.info(f"Loading Face Model: {face_path} (GPU/CPU)...")
+        logger.info(f"Loading Face Model: {face_path} (GPU)...")
         yolo_face_model = YOLO(face_path, verbose=False)
-        try:
-            yolo_face_model.to(DEVICE_STR)
-        except: pass
+        yolo_face_model.to(DEVICE_STR)
     else:
         logger.error("Failed to load Face Model.")
 
@@ -257,248 +230,129 @@ def _load_resources():
         logger.info("Loading GFPGAN Weights...")
         try:
             gfpgan_enhancer = GFPGANer(model_path='https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.3.pth', upscale=2, arch='clean', channel_multiplier=2, bg_upsampler=None, device=DEVICE_STR)
-        except Exception as e:
-            logger.warning(f"GFPGAN load failed: {e}")
+        except: 
             with data_lock: server_data["face_enhancement_mode"] = "off_disabled"
 
     load_known_faces(KNOWN_FACES_DIR)
 
-# --- VIDEO READER: USE FFMPEG PIPE FOR LOW LATENCY ---
+# --- VIDEO THREADS ---
 def _frame_reader_loop(source):
-    """
-    Aggressive low-latency reader using ffmpeg stdout rawvideo pipe.
-    Falls back to cv2.VideoCapture if ffmpeg is not available or fails.
-    """
-    global latest_raw_frame, latest_raw_frame_ts, APP_SHOULD_QUIT, VIDEO_THREAD_STARTED, CURRENT_STREAM_SOURCE
+    global latest_raw_frame, data_lock, APP_SHOULD_QUIT, VIDEO_THREAD_STARTED, CURRENT_STREAM_SOURCE
+    cap = None
+    
+    def connect(src):
+        if isinstance(src, int): return cv2.VideoCapture(src)
+        return cv2.VideoCapture(src, cv2.CAP_FFMPEG) 
 
-    def cv_capture(src):
-        cap = cv2.VideoCapture(src, cv2.CAP_FFMPEG)
-        if cap.isOpened():
-            try:
-                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            except:
-                pass
-        return cap
+    logger.info(f"Starting Video Reader on: {source}")
+    while not APP_SHOULD_QUIT:
+        if cap is None or not cap.isOpened():
+            cap = connect(source)
+            if not cap.isOpened() and source == STREAM_PI_RTSP:
+                logger.warning("RTSP Failed. Switching to HLS Fallback.")
+                source = STREAM_PI_HLS; CURRENT_STREAM_SOURCE = STREAM_PI_HLS; continue
+            if cap.isOpened():
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1); VIDEO_THREAD_STARTED = True
+                logger.info("Video Stream Connected.")
+            else: 
+                time.sleep(2); continue
 
-    # If source is an int or not an RTSP URL, use OpenCV path
-    if isinstance(source, int) or (not source.startswith("rtsp://")) or (not ffmpeg_exists()):
-        logger.info("Using OpenCV VideoCapture fallback.")
-        cap = cv_capture(source)
-        while not APP_SHOULD_QUIT:
-            if cap is None or not cap.isOpened():
-                cap = cv_capture(source)
-                if not cap.isOpened():
-                    time.sleep(1)
-                    continue
-                else:
-                    VIDEO_THREAD_STARTED = True
-                    logger.info("VideoCapture connected (fallback).")
-            ret, frame = cap.read()
-            if not ret:
-                logger.warning("CV capture failed frame. reconnecting...")
-                try:
-                    cap.release()
-                except:
-                    pass
-                cap = None
-                time.sleep(0.2)
-                continue
-            with data_lock:
-                latest_raw_frame = frame
-                latest_raw_frame_ts = time.time()
-        if cap:
-            cap.release()
-        return
+        ret, frame = cap.read()
+        if not ret: 
+            logger.warning("Frame dropped. Reconnecting...")
+            cap.release(); time.sleep(0.5); continue
+        with data_lock: latest_raw_frame = frame
+    if cap: cap.release()
 
-    # Build ffmpeg command to output raw BGR24 frames scaled to target size
-    ffmpeg_cmd = [
-        "ffmpeg",
-        "-rtsp_transport", "tcp",
-        "-fflags", "nobuffer",
-        "-flags", "low_delay",
-        "-framedrop",
-        "-i", source,
-        "-an", "-sn",
-        "-vf", f"scale={FRAME_WIDTH}:{FRAME_HEIGHT}",
-        "-r", str(TARGET_FPS),
-        "-f", "rawvideo",
-        "-pix_fmt", "bgr24",
-        "-"
-    ]
-
-    logger.info("Starting ffmpeg reader for low-latency RTSP.")
-    try:
-        proc = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=10**7)
-        VIDEO_THREAD_STARTED = True
-        frame_size = FRAME_WIDTH * FRAME_HEIGHT * 3
-        while not APP_SHOULD_QUIT:
-            # Read exact bytes for one frame
-            raw = proc.stdout.read(frame_size)
-            if not raw or len(raw) < frame_size:
-                # EOF or truncated read -> try to restart ffmpeg
-                logger.warning("FFmpeg frame read failed/truncated; restarting ffmpeg reader.")
-                try:
-                    proc.kill()
-                except:
-                    pass
-                time.sleep(0.2)
-                # attempt to restart
-                proc = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=10**7)
-                continue
-            # Convert to numpy image
-            frame = np.frombuffer(raw, dtype=np.uint8).reshape((FRAME_HEIGHT, FRAME_WIDTH, 3))
-            now = time.time()
-            # Aggressively drop stale frames: only keep the newest frame
-            with data_lock:
-                latest_raw_frame = frame
-                latest_raw_frame_ts = now
-        # cleanup
-        try:
-            proc.kill()
-        except:
-            pass
-    except Exception as e:
-        logger.exception(f"FFmpeg reader failed: {e}")
-        # fallback to cv2
-        source_fallback = source
-        logger.info("Falling back to OpenCV capture after ffmpeg failure.")
-        cap = cv_capture(source_fallback)
-        while not APP_SHOULD_QUIT:
-            if cap is None or not cap.isOpened():
-                cap = cv_capture(source_fallback)
-                if not cap.isOpened():
-                    time.sleep(1)
-                    continue
-                else:
-                    VIDEO_THREAD_STARTED = True
-            ret, frame = cap.read()
-            if not ret:
-                time.sleep(0.2); continue
-            with data_lock:
-                latest_raw_frame = frame
-                latest_raw_frame_ts = time.time()
-        if cap:
-            cap.release()
-
-# --- VIDEO PROCESSING THREAD (non-blocking, drop-stale-frame pattern) ---
 def video_processing_thread():
     global data_lock, output_frame, server_data, APP_SHOULD_QUIT, latest_raw_frame
-    global person_registry, last_face_locations, latest_raw_frame_ts
+    global person_registry, last_face_locations
     
     frame_count = 0
-    # limit workers appropriately: face encodings can be parallelized but don't create too many threads
-    executor = ThreadPoolExecutor(max_workers=4)
+    executor = ThreadPoolExecutor(max_workers=8) 
 
-    # keep a small local cache so we don't constantly re-lock server_data
     while not APP_SHOULD_QUIT:
-        # Try to get the freshest frame. If another (newer) frame arrives while processing, we'll drop this one.
+        frame = None
         with data_lock:
-            frame = latest_raw_frame.copy() if latest_raw_frame is not None else None
-            frame_ts = latest_raw_frame_ts
+            if latest_raw_frame is not None: frame = latest_raw_frame.copy()
+        if frame is None: time.sleep(0.01); continue
 
-        if frame is None:
-            time.sleep(0.005)
-            continue
-
-        # If the frame is older than 0.5s compared to now, skip it (drop)
-        if time.time() - frame_ts > 0.5:
-            # drop stale frame
-            continue
-
-        # Resize once to target (ffmpeg already scaled but keep safe)
         frame = resize_with_aspect_ratio(frame, max_w=FRAME_WIDTH, max_h=FRAME_HEIGHT)
-        if frame is None:
-            continue
-
+        if frame is None: continue
         frame_count += 1
-
-        # Read small copies of server config
+        
         with data_lock:
             enhancement_mode = server_data["face_enhancement_mode"]
             yolo_conf = server_data["yolo_conf"]
 
-        # 1. YOLO Body Tracking (YOLO11 - GPU if available)
-        try:
-            # Synchronous call -- track is stateful. Keep this synchronous but fast.
-            body_results = yolo_body_model.track(frame, persist=True, classes=[0], conf=yolo_conf, verbose=False)
-        except Exception as e:
-            logger.warning(f"Body tracking failed: {e}")
-            body_results = []
-
+        # 1. YOLO Body Tracking (YOLO11 - GPU)
+        body_results = yolo_body_model.track(frame, persist=True, classes=[0], conf=yolo_conf, verbose=False)
         body_boxes = {}; active_track_ids = []
-        try:
-            if len(body_results) > 0 and getattr(body_results[0].boxes, "id", None) is not None:
-                boxes = body_results[0].boxes.xyxy.cpu().numpy().astype(int)
-                track_ids = body_results[0].boxes.id.cpu().numpy().astype(int)
-                for box, track_id in zip(boxes, track_ids):
-                    l, t, r, b = box
-                    # convert to (top, right, bottom, left)
-                    body_boxes[int(track_id)] = (int(t), int(r), int(b), int(l))
-                    active_track_ids.append(int(track_id))
-                    if track_id not in person_registry:
-                        person_registry[track_id] = {"name": "Unknown", "conf": 0.0, "last_seen": time.time()}
-        except Exception as e:
-            logger.debug(f"No body boxes: {e}")
+        
+        if body_results[0].boxes.id is not None:
+            boxes = body_results[0].boxes.xyxy.cpu().numpy().astype(int)
+            track_ids = body_results[0].boxes.id.cpu().numpy().astype(int)
+            for box, track_id in zip(boxes, track_ids):
+                l, t, r, b = box
+                body_boxes[track_id] = (t, r, b, l)
+                active_track_ids.append(track_id)
+                if track_id not in person_registry:
+                    person_registry[track_id] = {"name": "Unknown", "conf": 0.0, "last_seen": time.time()}
 
-        # 2. YOLO Face Detection (run only every Nth frame)
-        current_face_locations = []
+        # 2. YOLO Face Detection (YOLOv11 Face - GPU)
         if frame_count % FACE_RECOGNITION_NTH_FRAME == 0 and yolo_face_model:
-            try:
-                face_results = yolo_face_model.predict(frame, conf=FACE_CONFIDENCE_THRESH, verbose=False)
-                if len(face_results) > 0:
-                    for box in face_results[0].boxes.xyxy.cpu().numpy().astype(int):
-                        l, t, r, b = box
-                        current_face_locations.append((int(t), int(r), int(b), int(l)))
-            except Exception as e:
-                logger.warning(f"Face detection failed: {e}")
+            face_results = yolo_face_model.predict(frame, conf=FACE_CONFIDENCE_THRESH, verbose=False)
+            
+            current_face_locations = []
+            if len(face_results) > 0:
+                for box in face_results[0].boxes.xyxy.cpu().numpy().astype(int):
+                    l, t, r, b = box
+                    current_face_locations.append((t, r, b, l)) # Top, Right, Bottom, Left
+            
+            last_face_locations = current_face_locations
 
-        # Publish last face locations for drawing
-        last_face_locations = current_face_locations
-
-        # 3. Recognition (offload encodings to executor)
-        face_encoding_futures = []
-        rgb_frame_for_encoding = None
-        if current_face_locations and len(known_face_encodings) > 0:
-            # convert once
+            # 3. Recognition (Dlib CPU)
             rgb_frame_for_encoding = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            
             for face_loc in current_face_locations:
-                # offload encoding to executor (fast model)
-                future = executor.submit(face_recognition.face_encodings, rgb_frame_for_encoding, [face_loc], "small")
-                face_encoding_futures.append((face_loc, future))
+                body_id = get_containing_body_box(face_loc, body_boxes)
+                if body_id is not None:
+                    top, right, bottom, left = face_loc
+                    
+                    input_image_encoding = rgb_frame_for_encoding
+                    if GFPGAN_AVAILABLE and enhancement_mode == "on" and gfpgan_enhancer:
+                         t_pad = max(0, top - BOX_PADDING); b_pad = min(frame.shape[0], bottom + BOX_PADDING)
+                         l_pad = max(0, left - BOX_PADDING); r_pad = min(frame.shape[1], right + BOX_PADDING)
+                         face_crop_bgr = frame[t_pad:b_pad, l_pad:r_pad]
+                         try:
+                             _, _, restored_face = gfpgan_enhancer.enhance(
+                                 face_crop_bgr, has_aligned=False, only_center_face=True, paste_back=False
+                             )
+                             if restored_face is not None:
+                                 input_image_encoding = cv2.cvtColor(restored_face, cv2.COLOR_BGR2RGB)
+                                 encoding_loc = [(0, input_image_encoding.shape[1], input_image_encoding.shape[0], 0)]
+                         except:
+                             encoding_loc = [face_loc] 
+                    else:
+                        encoding_loc = [face_loc]
 
-        # Process results of encodings (non-blocking wait with small timeout to avoid large stalls)
-        for face_loc, future in face_encoding_futures:
-            try:
-                face_encs = future.result(timeout=0.45)  # keep timeout small so it won't block long
-            except Exception as e:
-                # encoding timed out or failed; skip this face
-                logger.debug(f"Face encoding failed/timed out: {e}")
-                continue
+                    face_enc = face_recognition.face_encodings(input_image_encoding, encoding_loc)
+                    
+                    name = "Unknown"; conf = 0.0
+                    if face_enc and len(known_face_encodings) > 0:
+                        matches = face_recognition.compare_faces(known_face_encodings, face_enc[0], tolerance=RECOGNITION_TOLERANCE)
+                        dists = face_recognition.face_distance(known_face_encodings, face_enc[0])
+                        if True in matches:
+                            best_idx = np.argmin(dists)
+                            name = known_face_names[best_idx]
+                            conf = max(0, min(100, (1.0 - dists[best_idx]) * 100))
+                    
+                    if name != "Unknown":
+                        person_registry[body_id]["name"] = name
+                        person_registry[body_id]["conf"] = conf
+                    person_registry[body_id]["last_seen"] = time.time()
 
-            if not face_encs:
-                continue
-            face_enc = face_encs[0]
-
-            body_id = get_containing_body_box(face_loc, body_boxes)
-            if body_id is None:
-                continue
-            name = "Unknown"; conf = 0.0
-            try:
-                matches = face_recognition.compare_faces(known_face_encodings, face_enc, tolerance=RECOGNITION_TOLERANCE)
-                dists = face_recognition.face_distance(known_face_encodings, face_enc)
-                if True in matches:
-                    best_idx = np.argmin(dists)
-                    name = known_face_names[best_idx]
-                    conf = max(0, min(100, (1.0 - dists[best_idx]) * 100))
-            except Exception as e:
-                logger.debug(f"Face compare failed: {e}")
-
-            if name != "Unknown":
-                person_registry[body_id]["name"] = name
-                person_registry[body_id]["conf"] = conf
-            person_registry[body_id]["last_seen"] = time.time()
-
-        # 4. Drawing overlay (fast)
+        # 4. Drawing
         for (ft, fr, fb, fl) in last_face_locations:
             cv2.rectangle(frame, (fl, ft), (fr, fb), COLOR_FACE_BOX, 2)
 
@@ -518,7 +372,6 @@ def video_processing_thread():
             cv2.putText(frame, label, (l + 5, t - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLOR_TEXT_FG, 2)
             live_face_payload.append({"name": name, "confidence": conf})
 
-        # Update output frame (only the freshest)
         with data_lock:
             output_frame = frame
             server_data["live_faces"] = live_face_payload

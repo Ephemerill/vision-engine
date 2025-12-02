@@ -27,9 +27,7 @@ RECOGNITION_TOLERANCE = 0.5
 WEB_SERVER_PORT = 5005
 
 # --- MODEL SELECTION (YOLOv11 Face) ---
-# Options: yolov11n-face.pt (Fastest), yolov11s-face.pt (Balanced), yolov11m-face.pt (Accurate)
-# We default to 'n' (Nano) for the 2060 Super to ensure high FPS.
-FACE_MODEL_NAME = "yolov11l-face.pt"
+FACE_MODEL_NAME = "yolov11n-face.pt"
 FACE_MODEL_URL = f"https://github.com/YapaLab/yolo-face/releases/download/v0.0.0/{FACE_MODEL_NAME}"
 
 # --- LOGGING SETUP ---
@@ -91,7 +89,7 @@ CURRENT_STREAM_SOURCE = STREAM_PI_RTSP
 server_data = {
     "is_recording": False, "keyframe_count": 0, "action_result": "", "live_faces": [],
     "model": MODEL_GEMMA, 
-    "yolo_model_key": "l", # Body model size
+    "yolo_model_key": "n", # Body model size
     "yolo_conf": 0.4, 
     "face_enhancement_mode": "off" 
 }

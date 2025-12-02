@@ -29,6 +29,7 @@ BOX_PADDING = 40
 # --- PERFORMANCE TUNING ---
 HIGH_CONFIDENCE_THRESHOLD = 65.0 
 RECOGNITION_COOLDOWN = 2.0 
+DIAGNOSTICS_INTERVAL = 5.0 # Print stats every 5 seconds
 
 # --- YOLO FACE CONFIG ---
 FACE_MODEL_NAME = "yolov11n-face.pt"
@@ -50,12 +51,6 @@ else:
 # --- IMPORTS (PYTORCH ONLY) ---
 # DISABLED GFPGAN
 GFPGAN_AVAILABLE = False
-# try:
-#     import gfpgan
-#     GFPGAN_AVAILABLE = True
-# except ImportError:
-#     GFPGAN_AVAILABLE = False
-#     logger.warning("⚠️  GFPGAN library not found. Enhancement will be disabled.")
 
 # --- FLASK APP ---
 app = Flask(__name__)
@@ -93,12 +88,23 @@ APP_SHOULD_QUIT = False
 VIDEO_THREAD_STARTED = False
 CURRENT_STREAM_SOURCE = STREAM_PI_RTSP 
 
+# --- METRICS STATE ---
+perf_stats = {
+    "fps": 0,
+    "body_ms": 0,
+    "face_det_ms": 0,
+    "face_rec_ms": 0,
+    "last_print": time.time(),
+    "frame_counter": 0,
+    "start_time": time.time()
+}
+
 server_data = {
     "is_recording": False, "keyframe_count": 0, "action_result": "", "live_faces": [],
     "model": MODEL_GEMMA, 
     "yolo_model_key": "n", 
     "yolo_conf": 0.4, 
-    "face_enhancement_mode": "off" # FORCED OFF
+    "face_enhancement_mode": "off" 
 }
 
 if not GFPGAN_AVAILABLE:
@@ -107,15 +113,6 @@ if not GFPGAN_AVAILABLE:
 # --- RESOURCES ---
 known_face_encodings = []
 known_face_names = []
-# Registry structure: 
-# { 
-#   track_id: { 
-#       "name": "Unknown", 
-#       "conf": 0.0,
-#       "last_seen": time,
-#       "last_recog_time": time 
-#   } 
-# }
 person_registry = {} 
 last_face_locations = [] 
 
@@ -125,6 +122,29 @@ yolo_face_model = None
 gfpgan_enhancer = None
 
 # --- HELPER FUNCTIONS ---
+def print_diagnostics():
+    global perf_stats
+    now = time.time()
+    if now - perf_stats["last_print"] > DIAGNOSTICS_INTERVAL:
+        fps = perf_stats["frame_counter"] / (now - perf_stats["last_print"])
+        
+        vram_usage = 0
+        if torch.cuda.is_available():
+            vram_usage = torch.cuda.memory_reserved(0) / 1024 / 1024 # MB
+        
+        print("\n=== PERFORMANCE DIAGNOSTICS ===")
+        print(f" > FPS:         {fps:.2f}")
+        print(f" > VRAM Used:   {vram_usage:.0f} MB")
+        print(f" > YOLO Body:   {perf_stats['body_ms']:.1f} ms")
+        print(f" > YOLO Face:   {perf_stats['face_det_ms']:.1f} ms")
+        print(f" > Face Recog:  {perf_stats['face_rec_ms']:.1f} ms (CPU)")
+        print("===============================\n")
+        
+        # Reset counters
+        perf_stats["last_print"] = now
+        perf_stats["frame_counter"] = 0
+        perf_stats["face_rec_ms"] = 0 # Reset specifically as it doesn't run every frame
+
 def get_face_model_path():
     if os.path.exists(FACE_MODEL_NAME):
         return FACE_MODEL_NAME
@@ -238,14 +258,6 @@ def run_flask():
 def _load_resources():
     global GFPGANer, GFPGAN_AVAILABLE, yolo_body_model, yolo_face_model, gfpgan_enhancer
     
-    # logger.info("Loading GFPGAN...")
-    # try:
-    #     from gfpgan import GFPGANer as G; GFPGANer = G
-    #     GFPGAN_AVAILABLE = True
-    # except: 
-    #     logger.error("Could not load GFPGANer class.")
-    #     GFPGAN_AVAILABLE = False
-
     logger.info("Loading YOLO11 Body Model (GPU)...")
     yolo_body_model = YOLO(YOLO_MODELS[server_data['yolo_model_key']], verbose=False)
     yolo_body_model.to(DEVICE_STR) 
@@ -258,13 +270,7 @@ def _load_resources():
     else:
         logger.error("Failed to load Face Model.")
 
-    if GFPGAN_AVAILABLE:
-        logger.info("Loading GFPGAN Weights...")
-        try:
-            gfpgan_enhancer = GFPGANer(model_path='https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.3.pth', upscale=2, arch='clean', channel_multiplier=2, bg_upsampler=None, device=DEVICE_STR)
-        except Exception as e: 
-            logger.error(f"Failed to init GFPGAN: {e}")
-            with data_lock: server_data["face_enhancement_mode"] = "off_disabled"
+    # GFPGAN is DISABLED in this version
 
     load_known_faces(KNOWN_FACES_DIR)
 
@@ -299,7 +305,7 @@ def _frame_reader_loop(source):
 
 def video_processing_thread():
     global data_lock, output_frame, server_data, APP_SHOULD_QUIT, latest_raw_frame
-    global person_registry, last_face_locations
+    global person_registry, last_face_locations, perf_stats
     
     frame_count = 0
 
@@ -315,13 +321,17 @@ def video_processing_thread():
         frame = resize_with_aspect_ratio(frame, max_w=FRAME_WIDTH, max_h=FRAME_HEIGHT)
         if frame is None: continue
         frame_count += 1
+        perf_stats["frame_counter"] += 1
         
         with data_lock:
             enhancement_mode = server_data["face_enhancement_mode"]
             yolo_conf = server_data["yolo_conf"]
 
         # 1. YOLO Body Tracking
+        t_start_body = time.time()
         body_results = yolo_body_model.track(frame, persist=True, classes=[0], conf=yolo_conf, verbose=False)
+        perf_stats["body_ms"] = (time.time() - t_start_body) * 1000
+
         body_boxes = {}; active_track_ids = []
         
         if body_results[0].boxes.id is not None:
@@ -329,7 +339,7 @@ def video_processing_thread():
             track_ids = body_results[0].boxes.id.cpu().numpy().astype(int)
             for box, track_id in zip(boxes, track_ids):
                 l, t, r, b = box
-                body_boxes[track_id] = (t, r, b, l) # Top, Right, Bottom, Left
+                body_boxes[track_id] = (t, r, b, l) 
                 active_track_ids.append(track_id)
                 if track_id not in person_registry:
                     person_registry[track_id] = {
@@ -341,7 +351,9 @@ def video_processing_thread():
 
         # 2. YOLO Face Detection & Recognition
         if frame_count % FACE_RECOGNITION_NTH_FRAME == 0 and yolo_face_model:
+            t_start_face = time.time()
             face_results = yolo_face_model.predict(frame, conf=FACE_CONFIDENCE_THRESH, verbose=False)
+            perf_stats["face_det_ms"] = (time.time() - t_start_face) * 1000
             
             current_face_locations = []
             if len(face_results) > 0:
@@ -367,10 +379,10 @@ def video_processing_thread():
 
                     top, right, bottom, left = face_loc
                     input_image_encoding = rgb_frame_for_encoding
-                    
-                    # GFPGAN BLOCK REMOVED/DISABLED IN LOGIC
                     encoding_loc = [face_loc]
 
+                    # --- TIMING RECOGNITION ---
+                    t_start_rec = time.time()
                     face_enc = face_recognition.face_encodings(input_image_encoding, encoding_loc)
                     
                     new_name = "Unknown"; new_conf = 0.0
@@ -383,6 +395,9 @@ def video_processing_thread():
                             new_name = known_face_names[best_idx]
                             new_conf = max(0, min(100, (1.0 - dists[best_idx]) * 100))
                     
+                    # Update Recog Stats (accumulate if multiple faces, though usually 1)
+                    perf_stats["face_rec_ms"] = (time.time() - t_start_rec) * 1000
+
                     current_name = current_data["name"]
                     current_conf = current_data["conf"]
                     should_update = False
@@ -424,6 +439,9 @@ def video_processing_thread():
             cv2.putText(frame, label, (l + 5, t - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLOR_TEXT_FG, 2)
             live_face_payload.append({"name": name, "confidence": conf})
 
+        # --- DIAGNOSTICS PRINT ---
+        print_diagnostics()
+
         with data_lock:
             output_frame = frame
             server_data["live_faces"] = live_face_payload
@@ -431,7 +449,7 @@ def video_processing_thread():
 # --- MAIN ---
 if __name__ == "__main__":
     print("---------------------------------------------------")
-    print(" HEADLESS VISION ENGINE STARTING (NO ENHANCEMENT) ")
+    print(" HEADLESS VISION ENGINE STARTING (WITH DIAGNOSTICS) ")
     print("---------------------------------------------------")
     
     reader = threading.Thread(target=_frame_reader_loop, args=(CURRENT_STREAM_SOURCE,), daemon=True)
@@ -456,13 +474,7 @@ if __name__ == "__main__":
     
     try:
         while True:
-            time.sleep(5)
-            with data_lock: faces = server_data['live_faces']
-            if faces:
-                names = [f['name'] for f in faces]
-                logger.info(f"Tracking: {names}")
-            else:
-                print(".", end="", flush=True)
+            time.sleep(1) # Main loop just sleeps, work is in threads
     except KeyboardInterrupt:
         APP_SHOULD_QUIT = True
         print("\nShutting down...")

@@ -272,19 +272,41 @@ def _load_resources():
         yolo_face_model.to(DEVICE_STR)
     load_known_faces(KNOWN_FACES_DIR)
 
-# --- THREAD 1: VIDEO READER (60+ FPS) ---
+# --- THREAD 1: VIDEO READER (REAL-TIME NO-SLEEP) ---
 def _frame_reader_loop(source):
     global latest_raw_frame, APP_SHOULD_QUIT
     logger.info(f"Starting Video Reader on: {source}")
+    
+    # 1. Force TCP and No Buffer via Environment
+    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay"
+    
     cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
+    
+    # 2. Force Buffer Size via API (Critical for no-lag)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
     while not APP_SHOULD_QUIT:
         if not cap.isOpened():
-            time.sleep(2); cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG); continue
+            logger.warning("Camera disconnected. Retrying in 3s...")
+            time.sleep(3)
+            cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
+            continue
+        
+        # 3. Read Frame (This blocks until frame arrives)
         ret, frame = cap.read()
+        
         if not ret:
-            logger.warning("Stream dropped..."); cap.release(); continue
-        with video_lock: latest_raw_frame = frame
-        time.sleep(0.015) 
+            logger.warning("Frame read error. Retrying...")
+            # Brief sleep ONLY on error to avoid spinning CPU
+            time.sleep(0.1) 
+            continue
+            
+        with video_lock: 
+            latest_raw_frame = frame
+        
+        # REMOVED: time.sleep() 
+        # By removing sleep, we ensure we read exactly as fast as the camera sends.
+        
     cap.release()
 
 # --- THREAD 2: RECOGNITION WORKER (CPU BOUND) ---
@@ -351,7 +373,7 @@ def recognition_worker_thread():
 def video_processing_thread():
     global latest_processed_results, perf_stats, person_registry
     frame_count = 0
-    curr_faces = [] # FIXED: Initialize outside the loop to prevent UnboundLocalError
+    curr_faces = [] 
 
     while not APP_SHOULD_QUIT:
         frame = None
@@ -439,7 +461,7 @@ def video_processing_thread():
 
 # --- MAIN ---
 if __name__ == "__main__":
-    print("--- SYSTEM STARTING (ASYNC ARCHITECTURE) ---")
+    print("--- SYSTEM STARTING (ZERO-LATENCY MODE) ---")
     
     # 1. Video Reader
     threading.Thread(target=_frame_reader_loop, args=(CURRENT_STREAM_SOURCE,), daemon=True).start()

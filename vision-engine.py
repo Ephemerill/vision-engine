@@ -29,8 +29,8 @@ BOX_PADDING = 40
 DIAGNOSTICS_INTERVAL = 5.0 
 HIGH_CONFIDENCE_THRESHOLD = 65.0 
 RECOGNITION_COOLDOWN = 2.0 
-UNKNOWN_RETRY_LIMIT = 5          # How many times to try recognizing a stranger
-UNKNOWN_LOCKOUT_TIME = 30.0      # How long to ignore a stranger after failing (seconds)
+UNKNOWN_RETRY_LIMIT = 5          
+UNKNOWN_LOCKOUT_TIME = 30.0      
 
 # --- YOLO FACE CONFIG ---
 FACE_MODEL_NAME = "yolov11n-face.pt"
@@ -67,7 +67,7 @@ FACE_RECOGNITION_NTH_FRAME = 3
 
 COLOR_BODY_KNOWN = (255, 100, 100) 
 COLOR_BODY_UNKNOWN = (100, 100, 255)
-COLOR_BODY_VISITOR = (150, 150, 150) # Gray for people we gave up on 
+COLOR_BODY_VISITOR = (150, 150, 150) 
 COLOR_FACE_BOX = (255, 255, 0) 
 COLOR_TEXT_FG = (255, 255, 255)
 
@@ -86,11 +86,10 @@ latest_processed_results = {
 }
 
 # The Registry: The Source of Truth for Names
-# { track_id: { "name": "Dave", "conf": 98.0, "last_recog": 0.0, "retries": 0, "status": "known" } }
 person_registry = {} 
 
 # The Queue: Jobs for the slow CPU thread
-recog_queue = queue.Queue(maxsize=1) # Keep queue small to prevent backlog lag
+recog_queue = queue.Queue(maxsize=1) 
 
 APP_SHOULD_QUIT = False
 CURRENT_STREAM_SOURCE = STREAM_PI_RTSP 
@@ -215,12 +214,12 @@ def generate_frames():
 
         if ai_data:
             # Draw Faces
-            for (ft, fr, fb, fl) in ai_data["face_boxes"]:
+            for (ft, fr, fb, fl) in ai_data.get("face_boxes", []):
                 cv2.rectangle(frame, (fl, ft), (fr, fb), COLOR_FACE_BOX, 2)
             
             # Draw Bodies
-            for track_id in ai_data["active_ids"]:
-                if track_id in ai_data["body_boxes"]:
+            for track_id in ai_data.get("active_ids", []):
+                if track_id in ai_data.get("body_boxes", {}):
                     t, r, b, l = ai_data["body_boxes"][track_id]
                     
                     # Defaults
@@ -352,6 +351,7 @@ def recognition_worker_thread():
 def video_processing_thread():
     global latest_processed_results, perf_stats, person_registry
     frame_count = 0
+    curr_faces = [] # FIXED: Initialize outside the loop to prevent UnboundLocalError
 
     while not APP_SHOULD_QUIT:
         frame = None
@@ -395,6 +395,7 @@ def video_processing_thread():
             face_results = yolo_face_model.predict(frame, conf=FACE_CONFIDENCE_THRESH, verbose=False)
             perf_stats["face_det_ms"] = (time.time() - t1) * 1000
             
+            # Reset and update face boxes
             curr_faces = []
             if len(face_results) > 0:
                 for box in face_results[0].boxes.xyxy.cpu().numpy().astype(int):
@@ -414,19 +415,15 @@ def video_processing_thread():
                         now = time.time()
                         
                         # LOGIC: WHEN TO SEND TO WORKER?
-                        # 1. If queue is full, skip (don't lag tracker)
                         if recog_queue.full(): continue
                         
-                        # 2. If 'Visitor', check cooldown
                         if p["status"] == "visitor":
                             if (now - p["last_recog"]) < UNKNOWN_LOCKOUT_TIME: continue
-                            else: p["status"] = "tracking"; p["retries"] = 0 # Retry after 30s
+                            else: p["status"] = "tracking"; p["retries"] = 0 
                         
-                        # 3. If 'Known', check High Conf Cooldown
                         if p["status"] == "known" and p["conf"] > HIGH_CONFIDENCE_THRESHOLD:
                              if (now - p["last_recog"]) < RECOGNITION_COOLDOWN: continue
                         
-                        # 4. If we just checked recently (regardless of result)
                         if (now - p["last_recog"]) < 1.0: continue
 
                     # Push to Queue

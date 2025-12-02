@@ -272,46 +272,60 @@ def _load_resources():
         yolo_face_model.to(DEVICE_STR)
     load_known_faces(KNOWN_FACES_DIR)
 
-# --- THREAD 1: VIDEO READER (FRAME SKIPPER MODE) ---
+# --- THREAD 1: VIDEO READER (DYNAMIC LAG-BUSTER) ---
 def _frame_reader_loop(source):
     global latest_raw_frame, APP_SHOULD_QUIT
     logger.info(f"Starting Video Reader on: {source}")
     
+    # Force low latency flags
     os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay"
-    cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
     
-    # Counter to skip frames
-    read_counter = 0
+    cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
     while not APP_SHOULD_QUIT:
         if not cap.isOpened():
-            time.sleep(3)
+            time.sleep(2)
             cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
             continue
+
+        # --- DYNAMIC BUFFER FLUSHING ---
+        # We loop and grab frames. If grabbing is "too fast" (< 15ms), 
+        # it means we are reading from an old buffer. We discard those.
+        # We only stop when grab() takes a realistic amount of time (> 15ms),
+        # which implies we effectively waited for a LIVE frame from the camera.
         
-        # 1. Grab (Cheap)
-        # This just pulls the packet from the network stack. 
-        # It does NOT fully decode the image.
-        if not cap.grab():
-            logger.warning("Stream dropped packet")
+        frames_skipped = 0
+        start_time = time.time()
+        
+        # Always grab at least once
+        ret = cap.grab()
+        
+        # If that grab was instant (buffered), keep grabbing until we hit live data
+        while ret and (time.time() - start_time) < 0.015:
+            frames_skipped += 1
+            start_time = time.time() # Reset timer for next grab
+            ret = cap.grab() # Discard old frame
+            
+            # Safety: Don't loop forever if camera is sending 1000fps garbage
+            if frames_skipped > 30: 
+                break 
+
+        if not ret:
+            logger.warning("Stream packet loss")
             time.sleep(0.1)
             continue
             
-        read_counter += 1
-        
-        # 2. Retrieve (Expensive) - Only do this every 2nd frame
-        # If we skip retrieval, we save ~10-15ms of CPU time per frame.
-        # This allows us to "race ahead" of the buffer.
-        if read_counter % 2 != 0:
-            continue
-            
-        # Actually decode the image
+        # We have reached the 'live' edge of the stream. Decode THIS frame.
         ret, frame = cap.retrieve()
-        if not ret: continue
+        if ret:
+            with video_lock: 
+                latest_raw_frame = frame
         
-        with video_lock: 
-            latest_raw_frame = frame
-        
+        # Optional logging to prove it's working
+        if frames_skipped > 0:
+            logger.info(f"Skipped {frames_skipped} old frames to maintain sync.")
+
     cap.release()
 
 # --- THREAD 2: RECOGNITION WORKER (CPU BOUND) ---

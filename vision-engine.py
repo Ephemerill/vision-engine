@@ -240,9 +240,18 @@ def _frame_reader_loop(source):
     global latest_raw_frame, data_lock, APP_SHOULD_QUIT, VIDEO_THREAD_STARTED, CURRENT_STREAM_SOURCE
     cap = None
     
+    # --- OPTIMIZED FFMPEG CONFIGURATION ---
+    # Force FFMPEG to use low latency flags for RTSP
+    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay|strict;experimental"
+
     def connect(src):
         if isinstance(src, int): return cv2.VideoCapture(src)
-        return cv2.VideoCapture(src, cv2.CAP_FFMPEG) 
+        # For RTSP/Network streams, we want to be very aggressive
+        cap = cv2.VideoCapture(src, cv2.CAP_FFMPEG)
+        if cap.isOpened():
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1) # Force buffer size to 1
+            # cap.set(cv2.CAP_PROP_FPS, 30) # Optional: Force FPS if needed
+        return cap
 
     logger.info(f"Starting Video Reader on: {source}")
     while not APP_SHOULD_QUIT:
@@ -252,15 +261,20 @@ def _frame_reader_loop(source):
                 logger.warning("RTSP Failed. Switching to HLS Fallback.")
                 source = STREAM_PI_HLS; CURRENT_STREAM_SOURCE = STREAM_PI_HLS; continue
             if cap.isOpened():
-                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1); VIDEO_THREAD_STARTED = True
+                VIDEO_THREAD_STARTED = True
                 logger.info("Video Stream Connected.")
             else: 
                 time.sleep(2); continue
 
+        # Aggressive frame clearing: read until the buffer is empty-ish or just read latest
+        # Ideally, with buffer=1, just reading once is enough.
+        # But to be safe against any internal buffering:
         ret, frame = cap.read()
+        
         if not ret: 
             logger.warning("Frame dropped. Reconnecting...")
             cap.release(); time.sleep(0.5); continue
+        
         with data_lock: latest_raw_frame = frame
     if cap: cap.release()
 

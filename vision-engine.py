@@ -24,7 +24,13 @@ from ultralytics import YOLO
 # --- CONFIGURATION ---
 RECOGNITION_TOLERANCE = 0.5 
 WEB_SERVER_PORT = 5005
-BOX_PADDING = 40  # Added missing variable to prevent crash during enhancement
+BOX_PADDING = 40
+
+# --- PERFORMANCE TUNING ---
+# If we know who you are with this confidence, we stop re-scanning you for a while.
+HIGH_CONFIDENCE_THRESHOLD = 65.0 
+# How long (seconds) to trust the tracker before running heavy recognition again
+RECOGNITION_COOLDOWN = 2.0 
 
 # --- YOLO FACE CONFIG ---
 FACE_MODEL_NAME = "yolov11n-face.pt"
@@ -90,9 +96,9 @@ CURRENT_STREAM_SOURCE = STREAM_PI_RTSP
 server_data = {
     "is_recording": False, "keyframe_count": 0, "action_result": "", "live_faces": [],
     "model": MODEL_GEMMA, 
-    "yolo_model_key": "l", 
+    "yolo_model_key": "n", 
     "yolo_conf": 0.4, 
-    "face_enhancement_mode": "on"  # Changed from 'off' to 'on'
+    "face_enhancement_mode": "on"
 }
 
 if not GFPGAN_AVAILABLE:
@@ -105,9 +111,9 @@ known_face_names = []
 # { 
 #   track_id: { 
 #       "name": "Unknown", 
-#       "conf": 0.0,        # Confidence of the RECOGNITION (0-100)
+#       "conf": 0.0,
 #       "last_seen": time,
-#       "locked": False     # If True, requires very high confidence to change
+#       "last_recog_time": time  <-- Added for optimization
 #   } 
 # }
 person_registry = {} 
@@ -168,49 +174,30 @@ def load_known_faces(known_faces_dir):
     logger.info(f"Loaded {count} known face identities.")
 
 def calculate_iou(boxA, boxB):
-    # boxA = face (t, r, b, l) -> convert to (x1, y1, x2, y2)
-    # boxB = body (t, r, b, l) -> convert to (x1, y1, x2, y2)
-    
-    # Face format: Top, Right, Bottom, Left
-    # Body format: Top, Right, Bottom, Left
-    
-    # Convert to x1, y1, x2, y2
     f_x1, f_y1, f_x2, f_y2 = boxA[3], boxA[0], boxA[1], boxA[2]
     b_x1, b_y1, b_x2, b_y2 = boxB[3], boxB[0], boxB[1], boxB[2]
 
-    # Intersection coordinates
     xA = max(f_x1, b_x1)
     yA = max(f_y1, b_y1)
     xB = min(f_x2, b_x2)
     yB = min(f_y2, b_y2)
 
-    # Compute intersection area
     interWidth = max(0, xB - xA)
     interHeight = max(0, yB - yA)
     interArea = interWidth * interHeight
 
-    # Compute areas of both boxes
     boxAArea = (f_x2 - f_x1) * (f_y2 - f_y1)
-    # We really just care how much of the FACE is inside the BODY
-    # So we calculate Intersection / FaceArea ratio
     if boxAArea == 0: return 0
     return interArea / float(boxAArea)
 
 def get_best_matching_body(face_box, body_boxes):
-    """
-    Finds which body box contains the most of the face box.
-    Returns track_id or None.
-    """
     best_iou = 0
     best_id = None
-    
     for track_id, body_box in body_boxes.items():
         iou = calculate_iou(face_box, body_box)
-        # Threshold: Face must be at least 50% inside the body box
         if iou > 0.5 and iou > best_iou:
             best_iou = iou
             best_id = track_id
-            
     return best_id
 
 def get_ip_addresses():
@@ -315,14 +302,20 @@ def video_processing_thread():
     global person_registry, last_face_locations
     
     frame_count = 0
-    executor = ThreadPoolExecutor(max_workers=8) 
+    # ThreadPoolExecutor removed: It's often counter-productive with OpenCV/Python GIL for real-time video 
+    # when doing CPU-heavy bound tasks like face_recognition unless carefully managed. 
+    # Single-threaded logic optimization is cleaner here.
 
     while not APP_SHOULD_QUIT:
         frame = None
         with data_lock:
             if latest_raw_frame is not None: frame = latest_raw_frame.copy()
-        if frame is None: time.sleep(0.01); continue
+        
+        if frame is None: 
+            time.sleep(0.01)
+            continue
 
+        # Resize early to save compute on all subsequent steps
         frame = resize_with_aspect_ratio(frame, max_w=FRAME_WIDTH, max_h=FRAME_HEIGHT)
         if frame is None: continue
         frame_count += 1
@@ -331,7 +324,7 @@ def video_processing_thread():
             enhancement_mode = server_data["face_enhancement_mode"]
             yolo_conf = server_data["yolo_conf"]
 
-        # 1. YOLO Body Tracking
+        # 1. YOLO Body Tracking (Fast, runs every loop)
         body_results = yolo_body_model.track(frame, persist=True, classes=[0], conf=yolo_conf, verbose=False)
         body_boxes = {}; active_track_ids = []
         
@@ -343,9 +336,15 @@ def video_processing_thread():
                 body_boxes[track_id] = (t, r, b, l) # Top, Right, Bottom, Left
                 active_track_ids.append(track_id)
                 if track_id not in person_registry:
-                    person_registry[track_id] = {"name": "Unknown", "conf": 0.0, "last_seen": time.time()}
+                    person_registry[track_id] = {
+                        "name": "Unknown", 
+                        "conf": 0.0, 
+                        "last_seen": time.time(),
+                        "last_recog_time": 0.0 # Initialize new field
+                    }
 
-        # 2. YOLO Face Detection
+        # 2. YOLO Face Detection & Recognition
+        # Only run every Nth frame to save massive resources
         if frame_count % FACE_RECOGNITION_NTH_FRAME == 0 and yolo_face_model:
             face_results = yolo_face_model.predict(frame, conf=FACE_CONFIDENCE_THRESH, verbose=False)
             
@@ -353,23 +352,38 @@ def video_processing_thread():
             if len(face_results) > 0:
                 for box in face_results[0].boxes.xyxy.cpu().numpy().astype(int):
                     l, t, r, b = box
-                    # Store as Top, Right, Bottom, Left for face_recognition compatibility
                     current_face_locations.append((t, r, b, l)) 
             
             last_face_locations = current_face_locations
-
-            # 3. Recognition Logic (Smart Sticky Update)
             rgb_frame_for_encoding = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             
             for face_loc in current_face_locations:
-                # Use IoU matching instead of simple center point
                 body_id = get_best_matching_body(face_loc, body_boxes)
                 
                 if body_id is not None:
-                    top, right, bottom, left = face_loc
+                    # --- OPTIMIZATION: RECOGNITION LOCKING ---
+                    current_data = person_registry[body_id]
+                    now = time.time()
                     
+                    # If we know them with high confidence and checked recently, SKIP heavy processing
+                    # This prevents running GFPGAN + FaceRecog on known people every 3 frames
+                    if (current_data["name"] != "Unknown" and 
+                        current_data["conf"] > HIGH_CONFIDENCE_THRESHOLD and 
+                        (now - current_data["last_recog_time"]) < RECOGNITION_COOLDOWN):
+                        # Update "last_seen" so the label stays, but don't re-compute
+                        person_registry[body_id]["last_seen"] = now
+                        continue 
+
+                    # If we are here, we need to recognize/re-verify
+                    top, right, bottom, left = face_loc
                     input_image_encoding = rgb_frame_for_encoding
-                    if GFPGAN_AVAILABLE and enhancement_mode == "on" and gfpgan_enhancer:
+                    
+                    # --- OPTIMIZATION: CONDITIONAL ENHANCEMENT ---
+                    # Only run GFPGAN if we really need it (confidence is low or unknown)
+                    # or if specifically requested. 
+                    should_enhance = (GFPGAN_AVAILABLE and enhancement_mode == "on" and gfpgan_enhancer)
+                    
+                    if should_enhance:
                          t_pad = max(0, top - BOX_PADDING); b_pad = min(frame.shape[0], bottom + BOX_PADDING)
                          l_pad = max(0, left - BOX_PADDING); r_pad = min(frame.shape[1], right + BOX_PADDING)
                          face_crop_bgr = frame[t_pad:b_pad, l_pad:r_pad]
@@ -388,6 +402,7 @@ def video_processing_thread():
                     else:
                         encoding_loc = [face_loc]
 
+                    # Actual Recognition (CPU Heavy)
                     face_enc = face_recognition.face_encodings(input_image_encoding, encoding_loc)
                     
                     new_name = "Unknown"; new_conf = 0.0
@@ -401,38 +416,25 @@ def video_processing_thread():
                             new_conf = max(0, min(100, (1.0 - dists[best_idx]) * 100))
                     
                     # --- SMART UPDATE LOGIC ---
-                    current_data = person_registry[body_id]
                     current_name = current_data["name"]
                     current_conf = current_data["conf"]
-                    
                     should_update = False
                     
                     if new_name != "Unknown":
-                        # Case 1: We found a name.
-                        if current_name == "Unknown":
-                            # Always update from Unknown -> Known
-                            should_update = True
+                        if current_name == "Unknown": should_update = True
                         elif new_name == current_name:
-                            # Re-confirming same person, update if confidence is decent
-                            if new_conf > current_conf - 10: # Allow slight dips
-                                should_update = True
+                            if new_conf > current_conf - 10: should_update = True
                         else:
-                            # CONFLICT: ID says "John", but face says "Bob"
-                            # Only overwrite if new confidence is significantly higher
-                            if new_conf > current_conf + 15:
-                                should_update = True
+                            if new_conf > current_conf + 15: should_update = True
                     else:
-                        # Case 2: Face seen, but not recognized (Unknown)
-                        # Do NOT overwrite a known name with "Unknown" just because of a bad angle
-                        # Only overwrite if the existing confidence was very low to begin with
-                        if current_name != "Unknown" and current_conf < 40:
-                            should_update = True
+                        if current_name != "Unknown" and current_conf < 40: should_update = True
 
                     if should_update:
                         person_registry[body_id]["name"] = new_name
                         person_registry[body_id]["conf"] = new_conf
                     
-                    person_registry[body_id]["last_seen"] = time.time()
+                    person_registry[body_id]["last_seen"] = now
+                    person_registry[body_id]["last_recog_time"] = now # Mark that we just did the heavy lifting
 
         # 4. Drawing
         for (ft, fr, fb, fl) in last_face_locations:
@@ -447,7 +449,6 @@ def video_processing_thread():
             
             cv2.rectangle(frame, (l, t), (r, b), color, 2)
             
-            # Label without Track ID (Clean)
             label = f"{name}"
             if name != "Unknown": label += f" ({int(conf)}%)"
             

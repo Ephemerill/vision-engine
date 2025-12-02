@@ -83,12 +83,8 @@ latest_processed_results = {
     "face_boxes": [],
 }
 
-# The Registry: The Source of Truth for Names
 person_registry = {} 
-
-# The Queue: Jobs for the slow CPU thread
 recog_queue = queue.Queue(maxsize=1) 
-
 APP_SHOULD_QUIT = False
 CURRENT_STREAM_SOURCE = STREAM_PI_RTSP 
 
@@ -120,8 +116,7 @@ def print_diagnostics():
         print(f"\n=== DIAGNOSTICS (FPS: {fps:.2f} | VRAM: {vram:.0f}MB) ===")
         print(f" > YOLO Body:   {perf_stats['body_ms']:.1f} ms")
         print(f" > YOLO Face:   {perf_stats['face_det_ms']:.1f} ms")
-        print(f" > Face Recog:  {perf_stats['face_rec_ms']:.1f} ms (Async Thread)")
-        print(f" > Queue Size:  {recog_queue.qsize()}")
+        print(f" > Face Recog:  {perf_stats['face_rec_ms']:.1f} ms")
         print("==============================================\n")
         
         perf_stats["last_print"] = now; perf_stats["frame_counter"] = 0; perf_stats["face_rec_ms"] = 0
@@ -185,7 +180,7 @@ def get_ip_addresses():
         return [s.getsockname()[0]]
     except: return []
 
-# --- FAST VIDEO READER CLASS ---
+# --- ULTRA-LOW LATENCY VIDEO READER ---
 class FastVideoReader:
     def __init__(self, source):
         self.source = source
@@ -194,6 +189,7 @@ class FastVideoReader:
         self.running = True
         self.thread = threading.Thread(target=self._update_loop, daemon=True)
         self.connected = False
+        self.last_frame_time = 0
         
     def start(self):
         self.thread.start()
@@ -202,22 +198,33 @@ class FastVideoReader:
     def _update_loop(self):
         logger.info(f"Connecting to stream: {self.source}")
         
-        # AGGRESSIVE: Set FFmpeg flags to ignore buffer
-        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay"
+        # --- CRITICAL LATENCY SETTINGS ---
+        # 1. rtsp_transport;tcp: Reliability
+        # 2. fflags;nobuffer: Tell ffmpeg to output frames immediately
+        # 3. analyzeduration;0: DO NOT analyze stream (removes 3-5s startup delay/buffer)
+        # 4. probesize;32: Minimum probe size to detect stream type
+        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
+            "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay|"
+            "strict;experimental|probesize;32|analyzeduration;0"
+        )
         
         cap = cv2.VideoCapture(self.source, cv2.CAP_FFMPEG)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1) # Only keep 1 frame in buffer
+        # Aggressively force buffer to 0 (OS dependent, but essential)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 0)
         
         while self.running:
             if not cap.isOpened():
                 self.connected = False
                 time.sleep(1)
                 cap = cv2.VideoCapture(self.source, cv2.CAP_FFMPEG)
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 0)
                 continue
             
-            # BLIND READ: Just read as fast as possible.
-            # If the processing thread is slow, we overwrite 'self.frame' 
-            # effectively dropping old frames.
+            # --- THE FLUSH LOOP ---
+            # If we are here, we want to grab the *latest* frame.
+            # But the internal buffer might still have old frames if decoded slowly.
+            # We simply read() as fast as we can.
+            
             ret, frame = cap.read()
             
             if not ret:
@@ -228,13 +235,17 @@ class FastVideoReader:
                 continue
 
             self.connected = True
+            
+            # Store frame and timestamp
             with self.lock:
                 self.frame = frame
+                self.last_frame_time = time.time()
                 
         cap.release()
 
     def read(self):
         with self.lock:
+            # Return copy to prevent race conditions during resize
             return self.frame.copy() if self.frame is not None else None
             
     def is_connected(self):
@@ -253,7 +264,6 @@ def index():
     return "<html><body style='background:black; text-align:center;'><h1 style='color:white;'>Vision Engine Live</h1><img src='/video_feed' style='width:90%; border:2px solid #333;'></body></html>"
 
 def generate_frames():
-    # --- DECOUPLED RENDERING LOOP ---
     while True:
         if stream_reader is None:
             time.sleep(0.1); continue
@@ -261,7 +271,7 @@ def generate_frames():
         frame = stream_reader.read()
         
         if frame is None:
-            time.sleep(0.02); continue
+            time.sleep(0.01); continue
 
         frame = resize_with_aspect_ratio(frame, max_w=FRAME_WIDTH, max_h=FRAME_HEIGHT)
 
@@ -269,7 +279,7 @@ def generate_frames():
         ai_data = None
         with results_lock: ai_data = latest_processed_results.copy()
         
-        # Get Registry Data (Thread Safe copy)
+        # Get Registry Data
         current_registry = {}
         with registry_lock: current_registry = person_registry.copy()
 
@@ -283,24 +293,16 @@ def generate_frames():
                 if track_id in ai_data.get("body_boxes", {}):
                     t, r, b, l = ai_data["body_boxes"][track_id]
                     
-                    # Defaults
                     name = "Scanning..."; conf = 0; color = COLOR_BODY_UNKNOWN
-                    
                     if track_id in current_registry:
                         p_data = current_registry[track_id]
                         name = p_data["name"]
                         conf = p_data["conf"]
-                        
-                        if name != "Unknown" and name != "Scanning...":
-                            color = COLOR_BODY_KNOWN
-                        elif p_data.get("status") == "visitor":
-                            name = "Visitor"
-                            color = COLOR_BODY_VISITOR
+                        if name not in ["Unknown", "Scanning..."]: color = COLOR_BODY_KNOWN
+                        elif p_data.get("status") == "visitor": name = "Visitor"; color = COLOR_BODY_VISITOR
                     
                     cv2.rectangle(frame, (l, t), (r, b), color, 2)
-                    
-                    label = f"{name}"
-                    if conf > 0: label += f" ({int(conf)}%)"
+                    label = f"{name} ({int(conf)}%)" if conf > 0 else name
                     
                     (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
                     cv2.rectangle(frame, (l, t - 25), (l + tw + 10, t), color, -1)
@@ -309,11 +311,14 @@ def generate_frames():
         (flag, encodedImage) = cv2.imencode(".jpg", frame)
         if flag:
             yield(b'--frame\r\n' b'Content-Type: image/jpeg\r\n\r\n' + bytearray(encodedImage) + b'\r\n')
-        time.sleep(0.03) 
+        
+        # Don't sleep too much here, or the browser buffer will fill up
+        time.sleep(0.01) 
 
 @app.route('/video_feed')
 def video_feed():
-    return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+    # Cache-Control is important to stop browsers from buffering
+    return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame', headers={'Cache-Control': 'no-cache'})
 
 def run_flask():
     try:
@@ -333,36 +338,27 @@ def _load_resources():
         yolo_face_model.to(DEVICE_STR)
     load_known_faces(KNOWN_FACES_DIR)
 
-# --- THREAD 2: RECOGNITION WORKER (CPU BOUND) ---
+# --- THREAD 2: RECOGNITION WORKER ---
 def recognition_worker_thread():
     global person_registry, perf_stats
     logger.info("Background Recognition Worker Started.")
-    
     while not APP_SHOULD_QUIT:
         try:
-            # Block for 0.1s so we can check APP_SHOULD_QUIT
             job = recog_queue.get(timeout=0.1) 
         except queue.Empty:
             continue
 
-        # Job Structure: {"id": track_id, "frame": rgb_frame, "loc": face_loc}
         track_id = job["id"]
         rgb_frame = job["frame"]
         face_loc = job["loc"]
         
         t_start = time.time()
-        
-        # 1. ENCODING
         try:
             encs = face_recognition.face_encodings(rgb_frame, [face_loc])
-        except Exception as e:
-            logger.error(f"Recog Error: {e}")
+        except:
             encs = []
 
-        new_name = "Unknown"
-        new_conf = 0.0
-
-        # 2. MATCHING
+        new_name = "Unknown"; new_conf = 0.0
         if encs and len(known_face_encodings) > 0:
             matches = face_recognition.compare_faces(known_face_encodings, encs[0], tolerance=RECOGNITION_TOLERANCE)
             dists = face_recognition.face_distance(known_face_encodings, encs[0])
@@ -371,61 +367,41 @@ def recognition_worker_thread():
                 new_name = known_face_names[best_idx]
                 new_conf = max(0, min(100, (1.0 - dists[best_idx]) * 100))
         
-        # 3. UPDATE REGISTRY (Thread Safe)
         with registry_lock:
             if track_id in person_registry:
                 entry = person_registry[track_id]
-                
                 if new_name != "Unknown":
-                    # We found a match!
-                    entry["name"] = new_name
-                    entry["conf"] = new_conf
-                    entry["status"] = "known"
-                    entry["retries"] = 0 # Reset retries
+                    entry["name"] = new_name; entry["conf"] = new_conf; entry["status"] = "known"; entry["retries"] = 0
                 else:
-                    # Still unknown
                     entry["retries"] += 1
-                    if entry["retries"] >= UNKNOWN_RETRY_LIMIT:
-                        entry["status"] = "visitor"
-                        logger.info(f"ID {track_id} marked as Visitor (Stopped trying).")
-                
+                    if entry["retries"] >= UNKNOWN_RETRY_LIMIT: entry["status"] = "visitor"
                 entry["last_recog"] = time.time()
-
         perf_stats["face_rec_ms"] = (time.time() - t_start) * 1000
 
-# --- THREAD 3: TRACKING LOOP (GPU BOUND) ---
+# --- THREAD 3: TRACKING LOOP ---
 def video_processing_thread():
     global latest_processed_results, perf_stats, person_registry
     frame_count = 0
     curr_faces = [] 
 
-    # Wait for reader to be ready
     while stream_reader is None or not stream_reader.is_connected():
         time.sleep(0.5)
 
     logger.info("Video Processing Loop Started.")
-
     while not APP_SHOULD_QUIT:
-        # AGGRESSIVE: Ask stream reader for the LATEST frame.
-        # It does not care if we missed 5 frames. It just gives us "Now".
         frame = stream_reader.read()
-        
-        if frame is None: 
-            time.sleep(0.01)
-            continue
+        if frame is None: time.sleep(0.005); continue # Spin fast if no frame
         
         frame = resize_with_aspect_ratio(frame, max_w=FRAME_WIDTH, max_h=FRAME_HEIGHT)
         frame_count += 1
         perf_stats["frame_counter"] += 1
         t0 = time.time()
         
-        # --- YOLO BODY ---
+        # Body Track
         body_results = yolo_body_model.track(frame, persist=True, classes=[0], conf=server_data["yolo_conf"], verbose=False)
         perf_stats["body_ms"] = (time.time() - t0) * 1000
         
-        body_boxes = {}
-        active_ids = []
-        
+        body_boxes = {}; active_ids = []
         if body_results[0].boxes.id is not None:
             boxes = body_results[0].boxes.xyxy.cpu().numpy().astype(int)
             track_ids = body_results[0].boxes.id.cpu().numpy().astype(int)
@@ -435,79 +411,52 @@ def video_processing_thread():
                     l, t, r, b = box
                     body_boxes[track_id] = (t, r, b, l)
                     active_ids.append(track_id)
-                    
-                    # Initialize in Registry if new
                     if track_id not in person_registry:
-                        person_registry[track_id] = {
-                            "name": "Unknown", "conf": 0.0, 
-                            "last_recog": 0, "retries": 0, "status": "tracking"
-                        }
+                        person_registry[track_id] = {"name": "Unknown", "conf": 0.0, "last_recog": 0, "retries": 0, "status": "tracking"}
 
-        # --- YOLO FACE ---
+        # Face Detect
         if frame_count % FACE_RECOGNITION_NTH_FRAME == 0 and yolo_face_model:
             t1 = time.time()
             face_results = yolo_face_model.predict(frame, conf=FACE_CONFIDENCE_THRESH, verbose=False)
             perf_stats["face_det_ms"] = (time.time() - t1) * 1000
             
-            # Reset and update face boxes
             curr_faces = []
             if len(face_results) > 0:
                 for box in face_results[0].boxes.xyxy.cpu().numpy().astype(int):
                     l, t, r, b = box
                     curr_faces.append((t, r, b, l))
             
-            # --- DISPATCH TO WORKER ---
+            # Recog Dispatch
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            
             for face_loc in curr_faces:
                 bid = get_best_matching_body(face_loc, body_boxes)
                 if bid is not None:
                     with registry_lock:
                         p = person_registry.get(bid)
                         if not p: continue
-                        
                         now = time.time()
-                        
-                        # LOGIC: WHEN TO SEND TO WORKER?
                         if recog_queue.full(): continue
-                        
                         if p["status"] == "visitor":
                             if (now - p["last_recog"]) < UNKNOWN_LOCKOUT_TIME: continue
                             else: p["status"] = "tracking"; p["retries"] = 0 
-                        
                         if p["status"] == "known" and p["conf"] > HIGH_CONFIDENCE_THRESHOLD:
                              if (now - p["last_recog"]) < RECOGNITION_COOLDOWN: continue
-                        
                         if (now - p["last_recog"]) < 1.0: continue
-
-                    # Push to Queue
                     recog_queue.put({"id": bid, "frame": rgb, "loc": face_loc})
 
-        # Publish Results for Flask
         with results_lock:
             latest_processed_results["body_boxes"] = body_boxes
             latest_processed_results["active_ids"] = active_ids
             latest_processed_results["face_boxes"] = curr_faces
-
+        
         print_diagnostics()
 
-# --- MAIN ---
 if __name__ == "__main__":
-    print("--- SYSTEM STARTING (REAL-TIME AGGRESSIVE MODE) ---")
-    
-    # 1. Start Fast Stream Reader (Thread-Safe Sink)
+    print("--- SYSTEM STARTING (ULTRA-LOW LATENCY) ---")
     stream_reader = FastVideoReader(CURRENT_STREAM_SOURCE).start()
-    
-    # 2. Load Models
     _load_resources()
-    
-    # 3. Recognition Worker (The Slow Thread)
     threading.Thread(target=recognition_worker_thread, daemon=True).start()
-
-    # 4. Tracking Loop (The Fast Thread)
     threading.Thread(target=video_processing_thread, daemon=True).start()
-    
-    # 5. Flask Render
     threading.Thread(target=run_flask, daemon=True).start()
     
     print("--- READY ---")

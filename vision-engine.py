@@ -7,16 +7,12 @@ import cv2
 import face_recognition 
 import os
 import numpy as np
-import ollama
 import threading
 import time
 import sys
-import subprocess 
-import base64
-import traceback
-import socket
 import logging
 import requests
+import av  # <--- NEW LIBRARY: PyAV
 from concurrent.futures import ThreadPoolExecutor
 import torch
 from flask import Flask, Response
@@ -39,6 +35,9 @@ if torch.cuda.is_available():
     DEVICE_STR = 'cuda:0'
     gpu_name = torch.cuda.get_device_name(0)
     logger.info(f"✅ GPU DETECTED: {gpu_name}")
+elif torch.backends.mps.is_available():
+    DEVICE_STR = 'mps'
+    logger.info("✅ APPLE SILICON (MPS) DETECTED")
 else:
     DEVICE_STR = 'cpu'
     logger.warning("⚠️  CRITICAL: GPU NOT DETECTED. Running on CPU.")
@@ -57,7 +56,6 @@ flask_log.setLevel(logging.ERROR)
 
 # --- SETTINGS ---
 MODEL_GEMMA = 'gemma3:4b'
-MODEL_OFF = 'off'
 
 STREAM_PI_IP = "100.114.210.58"
 STREAM_PI_RTSP = f"rtsp://admin:mysecretpassword@{STREAM_PI_IP}:8554/cam?rtsp_transport=tcp"
@@ -69,6 +67,7 @@ FRAME_HEIGHT = 480
 KNOWN_FACES_DIR = "known_faces"
 FACE_CONFIDENCE_THRESH = 0.5 
 FACE_RECOGNITION_NTH_FRAME = 3 
+BOX_PADDING = 10
 
 COLOR_BODY_KNOWN = (255, 100, 100) 
 COLOR_BODY_UNKNOWN = (100, 100, 255) 
@@ -168,6 +167,7 @@ def get_containing_body_box(face_box, body_boxes):
     return None
 
 def get_ip_addresses():
+    import socket
     ips = []
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -180,7 +180,7 @@ def get_ip_addresses():
 # --- FLASK ROUTES ---
 @app.route('/')
 def index():
-    return "<html><body style='background:black; text-align:center;'><h1 style='color:white;'>Vision Engine Live</h1><img src='/video_feed' style='width:90%; border:2px solid #333;'></body></html>"
+    return "<html><body style='background:black; text-align:center;'><h1 style='color:white;'>Vision Engine Live (PyAV)</h1><img src='/video_feed' style='width:90%; border:2px solid #333;'></body></html>"
 
 def generate_frames():
     while True:
@@ -235,48 +235,92 @@ def _load_resources():
 
     load_known_faces(KNOWN_FACES_DIR)
 
-# --- VIDEO THREADS ---
+# --- PYAV VIDEO THREAD ---
 def _frame_reader_loop(source):
-    global latest_raw_frame, data_lock, APP_SHOULD_QUIT, VIDEO_THREAD_STARTED, CURRENT_STREAM_SOURCE
-    cap = None
+    """
+    Replaces OpenCV VideoCapture with PyAV for low-latency decoding.
+    """
+    global latest_raw_frame, data_lock, APP_SHOULD_QUIT, VIDEO_THREAD_STARTED
     
-    def connect(src):
-        if isinstance(src, int): return cv2.VideoCapture(src)
-        return cv2.VideoCapture(src, cv2.CAP_FFMPEG) 
+    logger.info(f"Starting PyAV Stream Reader on: {source}")
+    
+    # If source is an integer (webcam), we must fallback to OpenCV
+    if isinstance(source, int):
+        logger.info("Source is Webcam index, falling back to OpenCV for reader.")
+        cap = cv2.VideoCapture(source)
+        while not APP_SHOULD_QUIT:
+            ret, frame = cap.read()
+            if ret:
+                with data_lock: latest_raw_frame = frame
+                VIDEO_THREAD_STARTED = True
+            else:
+                time.sleep(0.1)
+        cap.release()
+        return
 
-    logger.info(f"Starting Video Reader on: {source}")
+    # RTSP / Network Stream Logic
     while not APP_SHOULD_QUIT:
-        if cap is None or not cap.isOpened():
-            cap = connect(source)
-            if not cap.isOpened() and source == STREAM_PI_RTSP:
-                logger.warning("RTSP Failed. Switching to HLS Fallback.")
-                source = STREAM_PI_HLS; CURRENT_STREAM_SOURCE = STREAM_PI_HLS; continue
-            if cap.isOpened():
-                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1); VIDEO_THREAD_STARTED = True
-                logger.info("Video Stream Connected.")
-            else: 
-                time.sleep(2); continue
+        try:
+            container = av.open(source, options={
+                'rtsp_transport': 'tcp',  # Force TCP for stability
+                'fflags': 'nobuffer',     # Crucial for low latency
+                'flags': 'low_delay'      # Crucial for low latency
+            })
+            
+            stream = container.streams.video[0]
+            stream.thread_type = 'AUTO' # Allow multithreaded decoding
+            
+            logger.info("PyAV Connected to Stream.")
+            VIDEO_THREAD_STARTED = True
 
-        ret, frame = cap.read()
-        if not ret: 
-            logger.warning("Frame dropped. Reconnecting...")
-            cap.release(); time.sleep(0.5); continue
-        with data_lock: latest_raw_frame = frame
-    if cap: cap.release()
+            # Standard iterator buffers too much. We manually process packets.
+            for frame in container.decode(stream):
+                if APP_SHOULD_QUIT: break
+                
+                # Convert AVFrame to numpy BGR array (what OpenCV expects)
+                img = frame.to_ndarray(format='bgr24')
+                
+                with data_lock:
+                    latest_raw_frame = img
+                
+                # If we are processing significantly slower than FPS, PyAV might internal buffer.
+                # Since we are just overwriting 'latest_raw_frame', we essentially drop frames here automatically.
+                
+        except av.AVError as e:
+            logger.error(f"PyAV Stream Error: {e}")
+            logger.info("Reconnecting in 2 seconds...")
+            time.sleep(2)
+        except Exception as e:
+            logger.error(f"Unexpected Stream Error: {e}")
+            time.sleep(2)
+        finally:
+            try:
+                if 'container' in locals(): container.close()
+            except: pass
 
 def video_processing_thread():
     global data_lock, output_frame, server_data, APP_SHOULD_QUIT, latest_raw_frame
     global person_registry, last_face_locations
     
     frame_count = 0
-    executor = ThreadPoolExecutor(max_workers=8) 
+    
+    # Wait for first frame
+    while latest_raw_frame is None and not APP_SHOULD_QUIT:
+        time.sleep(0.1)
 
     while not APP_SHOULD_QUIT:
         frame = None
+        
+        # Grab the absolute latest frame from the reader thread
         with data_lock:
-            if latest_raw_frame is not None: frame = latest_raw_frame.copy()
-        if frame is None: time.sleep(0.01); continue
+            if latest_raw_frame is not None: 
+                frame = latest_raw_frame.copy()
+        
+        if frame is None: 
+            time.sleep(0.01)
+            continue
 
+        # Resize early to improve FPS
         frame = resize_with_aspect_ratio(frame, max_w=FRAME_WIDTH, max_h=FRAME_HEIGHT)
         if frame is None: continue
         frame_count += 1
@@ -286,18 +330,22 @@ def video_processing_thread():
             yolo_conf = server_data["yolo_conf"]
 
         # 1. YOLO Body Tracking (YOLO11 - GPU)
-        body_results = yolo_body_model.track(frame, persist=True, classes=[0], conf=yolo_conf, verbose=False)
-        body_boxes = {}; active_track_ids = []
-        
-        if body_results[0].boxes.id is not None:
-            boxes = body_results[0].boxes.xyxy.cpu().numpy().astype(int)
-            track_ids = body_results[0].boxes.id.cpu().numpy().astype(int)
-            for box, track_id in zip(boxes, track_ids):
-                l, t, r, b = box
-                body_boxes[track_id] = (t, r, b, l)
-                active_track_ids.append(track_id)
-                if track_id not in person_registry:
-                    person_registry[track_id] = {"name": "Unknown", "conf": 0.0, "last_seen": time.time()}
+        try:
+            body_results = yolo_body_model.track(frame, persist=True, classes=[0], conf=yolo_conf, verbose=False)
+            body_boxes = {}; active_track_ids = []
+            
+            if body_results[0].boxes.id is not None:
+                boxes = body_results[0].boxes.xyxy.cpu().numpy().astype(int)
+                track_ids = body_results[0].boxes.id.cpu().numpy().astype(int)
+                for box, track_id in zip(boxes, track_ids):
+                    l, t, r, b = box
+                    body_boxes[track_id] = (t, r, b, l)
+                    active_track_ids.append(track_id)
+                    if track_id not in person_registry:
+                        person_registry[track_id] = {"name": "Unknown", "conf": 0.0, "last_seen": time.time()}
+        except Exception as e:
+            logger.error(f"YOLO Tracking Error: {e}")
+            continue
 
         # 2. YOLO Face Detection (YOLOv11 Face - GPU)
         if frame_count % FACE_RECOGNITION_NTH_FRAME == 0 and yolo_face_model:
@@ -311,7 +359,7 @@ def video_processing_thread():
             
             last_face_locations = current_face_locations
 
-            # 3. Recognition (Dlib CPU)
+            # 3. Recognition
             rgb_frame_for_encoding = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             
             for face_loc in current_face_locations:
@@ -331,6 +379,8 @@ def video_processing_thread():
                              if restored_face is not None:
                                  input_image_encoding = cv2.cvtColor(restored_face, cv2.COLOR_BGR2RGB)
                                  encoding_loc = [(0, input_image_encoding.shape[1], input_image_encoding.shape[0], 0)]
+                             else:
+                                 encoding_loc = [face_loc]
                          except:
                              encoding_loc = [face_loc] 
                     else:
@@ -379,7 +429,7 @@ def video_processing_thread():
 # --- MAIN ---
 if __name__ == "__main__":
     print("---------------------------------------------------")
-    print(" HEADLESS VISION ENGINE STARTING ")
+    print(" HEADLESS VISION ENGINE (PYAV EDITION) STARTING ")
     print("---------------------------------------------------")
     
     reader = threading.Thread(target=_frame_reader_loop, args=(CURRENT_STREAM_SOURCE,), daemon=True)

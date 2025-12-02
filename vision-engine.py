@@ -272,40 +272,45 @@ def _load_resources():
         yolo_face_model.to(DEVICE_STR)
     load_known_faces(KNOWN_FACES_DIR)
 
-# --- THREAD 1: VIDEO READER (REAL-TIME NO-SLEEP) ---
+# --- THREAD 1: VIDEO READER (FRAME SKIPPER MODE) ---
 def _frame_reader_loop(source):
     global latest_raw_frame, APP_SHOULD_QUIT
     logger.info(f"Starting Video Reader on: {source}")
     
-    # 1. Force TCP and No Buffer via Environment
     os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay"
-    
     cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
     
-    # 2. Force Buffer Size via API (Critical for no-lag)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    # Counter to skip frames
+    read_counter = 0
 
     while not APP_SHOULD_QUIT:
         if not cap.isOpened():
-            logger.warning("Camera disconnected. Retrying in 3s...")
             time.sleep(3)
             cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
             continue
         
-        # 3. Read Frame (This blocks until frame arrives)
-        ret, frame = cap.read()
-        
-        if not ret:
-            logger.warning("Frame read error. Retrying...")
-            # Brief sleep ONLY on error to avoid spinning CPU
-            time.sleep(0.1) 
+        # 1. Grab (Cheap)
+        # This just pulls the packet from the network stack. 
+        # It does NOT fully decode the image.
+        if not cap.grab():
+            logger.warning("Stream dropped packet")
+            time.sleep(0.1)
             continue
             
+        read_counter += 1
+        
+        # 2. Retrieve (Expensive) - Only do this every 2nd frame
+        # If we skip retrieval, we save ~10-15ms of CPU time per frame.
+        # This allows us to "race ahead" of the buffer.
+        if read_counter % 2 != 0:
+            continue
+            
+        # Actually decode the image
+        ret, frame = cap.retrieve()
+        if not ret: continue
+        
         with video_lock: 
             latest_raw_frame = frame
-        
-        # REMOVED: time.sleep() 
-        # By removing sleep, we ensure we read exactly as fast as the camera sends.
         
     cap.release()
 
@@ -461,7 +466,7 @@ def video_processing_thread():
 
 # --- MAIN ---
 if __name__ == "__main__":
-    print("--- SYSTEM STARTING (ZERO-LATENCY MODE) ---")
+    print("--- SYSTEM STARTING (FRAME SKIPPING MODE) ---")
     
     # 1. Video Reader
     threading.Thread(target=_frame_reader_loop, args=(CURRENT_STREAM_SOURCE,), daemon=True).start()

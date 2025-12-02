@@ -13,6 +13,9 @@ import sys
 import logging
 import requests
 import av 
+# --- SILENCE FFMPEG CONSOLE SPAM ---
+av.logging.set_level(av.logging.FATAL) 
+
 from concurrent.futures import ThreadPoolExecutor
 import torch
 from flask import Flask, Response
@@ -22,7 +25,7 @@ from ultralytics import YOLO
 RECOGNITION_TOLERANCE = 0.5 
 WEB_SERVER_PORT = 5005
 
-# --- MODEL SELECTION (YOLOv11 Face) ---
+# --- MODEL SELECTION ---
 FACE_MODEL_NAME = "yolov11n-face.pt"
 FACE_MODEL_URL = f"https://github.com/YapaLab/yolo-face/releases/download/v0.0.0/{FACE_MODEL_NAME}"
 
@@ -56,7 +59,7 @@ flask_log.setLevel(logging.ERROR)
 
 # --- SETTINGS ---
 STREAM_PI_IP = "100.114.210.58"
-# TRY UDP FIRST (Lowest Latency), Fallback to TCP in code
+# NOTE: We use TCP now, but with NO BUFFER settings
 STREAM_PI_RTSP = f"rtsp://admin:mysecretpassword@{STREAM_PI_IP}:8554/cam"
 STREAM_WEBCAM = 0
 
@@ -86,20 +89,18 @@ CURRENT_STREAM_SOURCE = STREAM_PI_RTSP
 # Monitoring Metrics
 metrics = {
     "transport": "INIT",
-    "latency_pickup": 0,    # Time fram sat in memory
-    "time_demux_gap": 0,    # Time between packets arriving (Jitter)
-    "time_decode": 0,       # Time to decode packet to numpy
-    "time_resize": 0,
+    "latency_pickup": 0,    
+    "time_demux_gap": 0,    
+    "time_decode": 0,      
     "time_body": 0,
     "time_face": 0,
     "time_recog": 0,
-    "time_draw": 0,
     "time_total": 0,
-    "skipped_frames": 0     # Frames dropped to catch up
+    "skipped_frames": 0     
 }
 
 server_data = {
-    "is_recording": False, "keyframe_count": 0, "action_result": "", "live_faces": [],
+    "is_recording": False, "live_faces": [],
     "model": "gemma3:4b", 
     "yolo_model_key": "n", 
     "yolo_conf": 0.4, 
@@ -180,7 +181,7 @@ def get_ip_addresses():
 def draw_metrics_overlay(frame, metrics):
     overlay = frame.copy()
     h, w = frame.shape[:2]
-    box_w, box_h = 240, 270
+    box_w, box_h = 240, 220
     cv2.rectangle(overlay, (w - box_w, 0), (w, box_h), (0, 0, 0), -1)
     cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
     
@@ -195,30 +196,20 @@ def draw_metrics_overlay(frame, metrics):
 
     cv2.putText(frame, f"Transport: {metrics['transport']}", (x_start, y_start), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
     
-    # Packet Jitter (Are packets arriving smoothly?)
-    jit = metrics['time_demux_gap']
-    cv2.putText(frame, f"Pkt Jitter: {jit:.1f}ms", (x_start, y_start + line_h), cv2.FONT_HERSHEY_SIMPLEX, 0.5, val_color(jit, 40, 100), 1)
-
-    # Decode Time
-    dec = metrics['time_decode']
-    cv2.putText(frame, f"Decoder: {dec:.1f}ms", (x_start, y_start + line_h*2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, val_color(dec, 15, 30), 1)
-
-    # Pickup Lag
     lag = metrics['latency_pickup']
-    cv2.putText(frame, f"Pickup Lag: {lag:.1f}ms", (x_start, y_start + line_h*3), cv2.FONT_HERSHEY_SIMPLEX, 0.5, val_color(lag, 50, 100), 1)
+    cv2.putText(frame, f"Pickup Lag: {lag:.1f}ms", (x_start, y_start + line_h), cv2.FONT_HERSHEY_SIMPLEX, 0.5, val_color(lag, 50, 100), 1)
 
-    # Skipped
-    cv2.putText(frame, f"Drop/Skip: {metrics['skipped_frames']}", (x_start, y_start + line_h*4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+    cv2.putText(frame, f"Drop/Skip: {metrics['skipped_frames']}", (x_start, y_start + line_h*2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
-    cv2.line(frame, (x_start, y_start + line_h*5), (w, y_start + line_h*5), (100,100,100), 1)
+    cv2.line(frame, (x_start, y_start + line_h*3), (w, y_start + line_h*3), (100,100,100), 1)
 
     # Processing Breakdown
-    cv2.putText(frame, f"YOLO Body: {metrics['time_body']:.1f}ms", (x_start, y_start + line_h*6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
-    cv2.putText(frame, f"YOLO Face: {metrics['time_face']:.1f}ms", (x_start, y_start + line_h*7), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
-    cv2.putText(frame, f"Recognize: {metrics['time_recog']:.1f}ms", (x_start, y_start + line_h*8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
+    cv2.putText(frame, f"YOLO Body: {metrics['time_body']:.1f}ms", (x_start, y_start + line_h*4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
+    cv2.putText(frame, f"YOLO Face: {metrics['time_face']:.1f}ms", (x_start, y_start + line_h*5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
+    cv2.putText(frame, f"Recognize: {metrics['time_recog']:.1f}ms", (x_start, y_start + line_h*6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
     
     tot = metrics['time_total']
-    cv2.putText(frame, f"TOTAL: {tot:.1f}ms", (x_start, y_start + line_h*10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, val_color(tot, 50, 150), 2)
+    cv2.putText(frame, f"TOTAL: {tot:.1f}ms", (x_start, y_start + line_h*8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, val_color(tot, 50, 150), 2)
     return frame
 
 # --- FLASK ---
@@ -259,7 +250,7 @@ def _load_resources():
         except: pass
     load_known_faces(KNOWN_FACES_DIR)
 
-# --- LOW LATENCY READER ---
+# --- STRICT NO-BUFFER TCP READER ---
 def _frame_reader_loop(source):
     global latest_raw_packet, data_lock, APP_SHOULD_QUIT, VIDEO_THREAD_STARTED, metrics
     
@@ -272,64 +263,57 @@ def _frame_reader_loop(source):
             else: time.sleep(0.1)
         return
 
-    # RETRY LOGIC for Protocol
-    protocols = ['udp', 'tcp'] # Try UDP first for speed
-    current_proto_idx = 0
+    # Force TCP for stability, but kill buffering for speed
+    proto = 'tcp'
+    metrics['transport'] = "TCP-NOBUF"
     
     while not APP_SHOULD_QUIT:
-        proto = protocols[current_proto_idx]
-        metrics['transport'] = proto.upper()
-        logger.info(f"Connecting via {proto.upper()}...")
-        
+        logger.info(f"Connecting via {proto.upper()} (No Buffer)...")
         container = None
         try:
             container = av.open(source, options={
                 'rtsp_transport': proto,
-                'fflags': 'nobuffer',
-                'flags': 'low_delay',
-                'probesize': '32',
-                'analyzeduration': '0',
-                'max_delay': '500000', # 0.5s max buffer
-                'reorder_queue_size': '0'
+                'fflags': 'nobuffer',     # Do not buffer packets
+                'flags': 'low_delay',     # Low delay mode
+                'probesize': '32',        # Fast startup
+                'analyzeduration': '0',   # Fast startup
+                'max_delay': '0',         # STRICTLY ZERO DELAY
+                'reorder_queue_size': '0' # Don't wait for ordering
             })
+            
             stream = container.streams.video[0]
             stream.thread_type = 'AUTO'
             
-            logger.info(f"Connected ({proto}). Streaming...")
+            logger.info(f"Connected. Streaming...")
             VIDEO_THREAD_STARTED = True
             
-            last_pkt_time = time.time()
-            
-            # DEMUX LOOP (Separate from Decode)
+            # Using DEMUX to manually control the flow
             for packet in container.demux(stream):
                 if APP_SHOULD_QUIT: break
                 
-                # Jitter Monitor
-                now = time.time()
-                metrics['time_demux_gap'] = (now - last_pkt_time) * 1000
-                last_pkt_time = now
-                
-                # Decode
                 if packet.dts is None: continue
                 
-                # Monitor Decode Time
-                t_dec_start = time.perf_counter()
-                frames = packet.decode()
+                # Check for corruption flags on the packet before decoding
+                if packet.is_corrupt:
+                    metrics['skipped_frames'] += 1
+                    continue
+
+                try:
+                    for frame in packet.decode():
+                        # If frame is incomplete/corrupt, PyAV might tag it
+                        if frame.is_corrupt:
+                            metrics['skipped_frames'] += 1
+                            continue
+
+                        img = frame.to_ndarray(format='bgr24')
+                        with data_lock:
+                            latest_raw_packet = (img, time.time())
+
+                except av.AVError:
+                    # Silence the error, just count it and move on
+                    metrics['skipped_frames'] += 1
+                    continue
                 
-                for frame in frames:
-                    # Convert to numpy
-                    img = frame.to_ndarray(format='bgr24')
-                    t_dec_end = time.perf_counter()
-                    metrics['time_decode'] = (t_dec_end - t_dec_start) * 1000
-                    
-                    with data_lock:
-                        latest_raw_packet = (img, time.time())
-                
-        except av.AVError as e:
-            logger.error(f"Stream Error ({proto}): {e}")
-            # Switch protocol on error
-            current_proto_idx = (current_proto_idx + 1) % len(protocols)
-            time.sleep(1)
         except Exception as e:
             logger.error(f"Reader Crash: {e}")
             time.sleep(1)
@@ -357,9 +341,7 @@ def video_processing_thread():
         metrics['latency_pickup'] = (time.time() - capture_ts) * 1000
         
         # 2. RESIZE
-        t0 = time.perf_counter()
         frame = resize_with_aspect_ratio(frame, max_w=FRAME_WIDTH, max_h=FRAME_HEIGHT)
-        metrics['time_resize'] = (time.perf_counter() - t0) * 1000
         if frame is None: continue
         frame_count += 1
         
@@ -423,7 +405,6 @@ def video_processing_thread():
         metrics['time_recog'] = (time.perf_counter() - t0) * 1000
 
         # 6. DRAWING
-        t0 = time.perf_counter()
         for (ft, fr, fb, fl) in last_face_locations:
             cv2.rectangle(frame, (fl, ft), (fr, fb), COLOR_FACE_BOX, 2)
 
@@ -436,7 +417,6 @@ def video_processing_thread():
             cv2.rectangle(frame, (l, t), (r, b), color, 2)
             cv2.putText(frame, f"{track_id}:{name}", (l, t - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
             live_face_payload.append({"name": name, "confidence": conf})
-        metrics['time_draw'] = (time.perf_counter() - t0) * 1000
         
         metrics['time_total'] = (time.perf_counter() - t_start_loop) * 1000
         frame = draw_metrics_overlay(frame, metrics)
@@ -448,7 +428,7 @@ def video_processing_thread():
 # --- MAIN ---
 if __name__ == "__main__":
     print("---------------------------------------------------")
-    print(" VISION ENGINE: LOW LATENCY MODE ")
+    print(" VISION ENGINE: STRICT TCP MODE ")
     print("---------------------------------------------------")
     reader = threading.Thread(target=_frame_reader_loop, args=(CURRENT_STREAM_SOURCE,), daemon=True)
     reader.start()

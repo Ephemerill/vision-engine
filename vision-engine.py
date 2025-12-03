@@ -12,9 +12,10 @@ import time
 import sys
 import logging
 import requests
+import socket
 from concurrent.futures import ThreadPoolExecutor
 import torch
-from flask import Flask, Response
+from flask import Flask, Response, make_response
 from ultralytics import YOLO
 
 # --- CONFIGURATION ---
@@ -30,10 +31,15 @@ logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
 logger = logging.getLogger("VisionEngine")
 
 # --- HARDWARE CHECK ---
+# Note: On Mac M1/M2/M3, PyTorch usually uses 'mps' device. 
+# Keeping 'cuda' check for Linux/Windows compatibility as requested.
 if torch.cuda.is_available():
     DEVICE_STR = 'cuda:0'
     gpu_name = torch.cuda.get_device_name(0)
     logger.info(f"✅ GPU DETECTED: {gpu_name}")
+elif torch.backends.mps.is_available():
+    DEVICE_STR = 'mps'
+    logger.info(f"✅ MAC GPU (MPS) DETECTED")
 else:
     DEVICE_STR = 'cpu'
     logger.warning("⚠️  CRITICAL: GPU NOT DETECTED. Running on CPU.")
@@ -55,7 +61,7 @@ MODEL_GEMMA = 'gemma3:4b'
 MODEL_OFF = 'off'
 
 STREAM_PI_IP = "100.114.210.58"
-STREAM_PI_RTSP = f"rtsp://admin:mysecretpassword@{STREAM_PI_IP}:8554/cam" # Force TCP via code, not URL params
+STREAM_PI_RTSP = f"rtsp://admin:mysecretpassword@{STREAM_PI_IP}:8554/cam" 
 STREAM_PI_HLS = f"http://{STREAM_PI_IP}:8888/cam/index.m3u8"
 STREAM_WEBCAM = 0
 
@@ -79,7 +85,6 @@ data_lock = threading.Lock()
 output_frame = None
 
 # OPTIMIZATION: "Atomic Packet" [Frame, Timestamp]
-# We use this instead of a queue to ensure we only ever have the absolute latest frame
 latest_packet = [None, 0.0] 
 
 APP_SHOULD_QUIT = False
@@ -89,7 +94,7 @@ CURRENT_STREAM_SOURCE = STREAM_PI_RTSP
 server_data = {
     "is_recording": False, "keyframe_count": 0, "action_result": "", "live_faces": [],
     "model": MODEL_GEMMA, 
-    "yolo_model_key": "n", # Body model size
+    "yolo_model_key": "n", 
     "yolo_conf": 0.4, 
     "face_enhancement_mode": "off" 
 }
@@ -179,22 +184,25 @@ def get_ip_addresses():
 
 def draw_perf_overlay(frame, timings, lag_ms):
     """Draws small performance metrics in top left."""
-    x, y = 10, 15
-    line_h = 12
-    font_scale = 0.4
-    color = (0, 255, 0)
+    x, y = 10, 20
+    line_h = 15
+    font_scale = 0.5
     
     # Draw Background Box for readability
-    cv2.rectangle(frame, (0, 0), (140, 120), (0, 0, 0), -1)
+    cv2.rectangle(frame, (0, 0), (160, 140), (0, 0, 0), -1)
     
     # 1. Real-Time Lag
-    lag_color = (0, 255, 0) if lag_ms < 200 else (0, 165, 255)
-    if lag_ms > 1000: lag_color = (0, 0, 255)
-    cv2.putText(frame, f"LAG: {lag_ms:.0f} ms", (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, lag_color, 1)
-    y += 18
+    # This is the difference between when the camera captured the frame 
+    # and when we are processing it.
+    lag_color = (0, 255, 0) 
+    if lag_ms > 200: lag_color = (0, 165, 255) # Orange
+    if lag_ms > 1000: lag_color = (0, 0, 255)  # Red
+    
+    cv2.putText(frame, f"LAG: {lag_ms:.0f} ms", (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, lag_color, 2)
+    y += 20
     
     # 2. Individual Timings
-    cv2.putText(frame, f"Total Proc: {timings['total']:.1f}ms", (x, y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, 1)
+    cv2.putText(frame, f"Total Proc: {timings['total']:.1f}ms", (x, y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 255, 0), 1)
     y += line_h
     cv2.putText(frame, "----------------", (x, y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (100,100,100), 1)
     y += line_h
@@ -218,13 +226,21 @@ def generate_frames():
         with data_lock:
             if output_frame is None:
                 time.sleep(0.01); continue
-            (flag, encodedImage) = cv2.imencode(".jpg", output_frame)
+            
+            # OPTIMIZATION: Reduce JPEG quality to 70 to lower packet size and network latency
+            (flag, encodedImage) = cv2.imencode(".jpg", output_frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
             if not flag: continue
+            
         yield(b'--frame\r\n' b'Content-Type: image/jpeg\r\n\r\n' + bytearray(encodedImage) + b'\r\n')
 
 @app.route('/video_feed')
 def video_feed():
-    return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+    response = make_response(Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame'))
+    # OPTIMIZATION: Prevent browser caching which causes "smoothness" at the cost of latency
+    response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+    response.headers['Pragma'] = 'no-cache'
+    response.headers['Expires'] = '0'
+    return response
 
 def run_flask():
     try:
@@ -242,15 +258,15 @@ def _load_resources():
         GFPGAN_AVAILABLE = True
     except: GFPGAN_AVAILABLE = False
 
-    # 1. Body Tracking (Standard YOLO11)
-    logger.info("Loading YOLO11 Body Model (GPU)...")
+    # 1. Body Tracking
+    logger.info("Loading YOLO11 Body Model...")
     yolo_body_model = YOLO(YOLO_MODELS[server_data['yolo_model_key']], verbose=False)
     yolo_body_model.to(DEVICE_STR) 
 
-    # 2. Face Detection (YOLOv11-Face)
+    # 2. Face Detection
     face_path = get_face_model_path()
     if face_path:
-        logger.info(f"Loading Face Model: {face_path} (GPU)...")
+        logger.info(f"Loading Face Model: {face_path}...")
         yolo_face_model = YOLO(face_path, verbose=False)
         yolo_face_model.to(DEVICE_STR)
     else:
@@ -271,7 +287,6 @@ def _frame_reader_loop(source):
     global latest_packet, data_lock, APP_SHOULD_QUIT, VIDEO_THREAD_STARTED, CURRENT_STREAM_SOURCE
     
     # CRITICAL: Set FFmpeg flags to ignore buffer.
-    # This makes OpenCV act like the Low Latency PyAV code from before.
     os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay"
     
     logger.info(f"Starting Speed Reader on: {source}")
@@ -283,6 +298,8 @@ def _frame_reader_loop(source):
             else: cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
             
             if cap.isOpened():
+                # OPTIMIZATION: Force buffer size to 1 to prevent internal buffering
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                 VIDEO_THREAD_STARTED = True
                 logger.info("✅ Stream Connected (Low Latency Mode)")
             else:
@@ -300,19 +317,19 @@ def _frame_reader_loop(source):
             
     if cap: cap.release()
 
-# --- PROCESSING THREAD (With Monitoring) ---
+# --- PROCESSING THREAD ---
 def video_processing_thread():
     global data_lock, output_frame, server_data, APP_SHOULD_QUIT, latest_packet
     global person_registry, last_face_locations
     
     frame_count = 0
-    executor = ThreadPoolExecutor(max_workers=8) 
-
+    # No executor needed here for this logic, main loop is fast enough usually
+    
     while not APP_SHOULD_QUIT:
         t_start_proc = time.perf_counter()
         timings = {}
         
-        # 1. ACQUIRE (Non-blocking check)
+        # 1. ACQUIRE
         frame = None
         capture_ts = 0
         with data_lock:
@@ -322,7 +339,7 @@ def video_processing_thread():
         
         if frame is None: time.sleep(0.005); continue
 
-        # CALC REAL-TIME LAG
+        # CALC REAL-TIME LAG (Input Lag)
         lag_ms = (time.time() - capture_ts) * 1000
 
         # 2. RESIZE
@@ -338,6 +355,7 @@ def video_processing_thread():
 
         # 3. YOLO BODY
         t0 = time.perf_counter()
+        # Persist=True is key for tracking ID stability
         body_results = yolo_body_model.track(frame, persist=True, classes=[0], conf=yolo_conf, verbose=False)
         body_boxes = {}; active_track_ids = []
         
@@ -484,4 +502,4 @@ if __name__ == "__main__":
                 print(".", end="", flush=True)
     except KeyboardInterrupt:
         APP_SHOULD_QUIT = True
-        print("\nShutting down...")f
+        print("\nShutting down...")

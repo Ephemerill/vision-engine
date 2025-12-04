@@ -452,16 +452,16 @@ def video_processing_thread():
             live_face_payload.append({"name": name, "confidence": conf})
         timings['draw'] = (time.perf_counter() - t0) * 1000
         
-        # 7. ENCODE ONCE (instead of encoding for every HTTP request)
+        # Calculate total timing (before overlay so it's accurate)
+        timings['total'] = (time.perf_counter() - t_start_proc) * 1000
+        
+        # RENDER DEBUG OVERLAY (must be before encoding)
+        frame = draw_perf_overlay(frame, timings, lag_ms)
+        
+        # 7. ENCODE ONCE (after overlay is drawn)
         t0 = time.perf_counter()
         (flag, encodedImage) = cv2.imencode(".jpg", frame, encode_param)
         timings['encode'] = (time.perf_counter() - t0) * 1000
-        
-        # Calculate total BEFORE rendering overlay
-        timings['total'] = (time.perf_counter() - t_start_proc) * 1000
-        
-        # RENDER DEBUG OVERLAY
-        frame = draw_perf_overlay(frame, timings, lag_ms)
         
         # Update global state
         if flag:

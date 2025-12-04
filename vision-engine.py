@@ -40,11 +40,8 @@ else:
     logger.warning("⚠️  CRITICAL: GPU NOT DETECTED. Running on CPU.")
 
 # --- IMPORTS (PYTORCH ONLY) ---
-try:
-    import gfpgan
-    GFPGAN_AVAILABLE = True
-except ImportError:
-    GFPGAN_AVAILABLE = False
+# GFPGAN DISABLED BY REQUEST
+GFPGAN_AVAILABLE = False
 
 # --- FLASK APP ---
 app = Flask(__name__)
@@ -93,11 +90,8 @@ server_data = {
     "model": MODEL_GEMMA, 
     "yolo_model_key": "n", # Body model size
     "yolo_conf": 0.4, 
-    "face_enhancement_mode": "off" 
+    "face_enhancement_mode": "off_disabled" # Forced disabled
 }
-
-if not GFPGAN_AVAILABLE:
-    server_data["face_enhancement_mode"] = "off_disabled"
 
 # --- RESOURCES ---
 known_face_encodings = []
@@ -244,12 +238,6 @@ def run_flask():
 def _load_resources():
     global GFPGANer, GFPGAN_AVAILABLE, yolo_body_model, yolo_face_model, gfpgan_enhancer
     
-    logger.info("Loading GFPGAN...")
-    try:
-        from gfpgan import GFPGANer as G; GFPGANer = G
-        GFPGAN_AVAILABLE = True
-    except: GFPGAN_AVAILABLE = False
-
     # 1. Body Tracking (Standard YOLO11)
     logger.info("Loading YOLO11 Body Model (GPU)...")
     yolo_body_model = YOLO(YOLO_MODELS[server_data['yolo_model_key']], verbose=False)
@@ -264,13 +252,10 @@ def _load_resources():
     else:
         logger.error("Failed to load Face Model.")
 
-    # 3. Face Enhancement
+    # 3. Face Enhancement - DISABLED
     if GFPGAN_AVAILABLE:
-        logger.info("Loading GFPGAN Weights...")
-        try:
-            gfpgan_enhancer = GFPGANer(model_path='https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.3.pth', upscale=2, arch='clean', channel_multiplier=2, bg_upsampler=None, device=DEVICE_STR)
-        except: 
-            with data_lock: server_data["face_enhancement_mode"] = "off_disabled"
+        # This block is now unreachable due to GFPGAN_AVAILABLE = False
+        pass
 
     load_known_faces(KNOWN_FACES_DIR)
 
@@ -318,7 +303,7 @@ def video_processing_thread():
     global person_registry, last_face_locations
     
     frame_count = 0
-    # No executor needed here for the sequential loop, removed to save overhead
+    # No executor needed here for the sequential loop
 
     while not APP_SHOULD_QUIT:
         t_start_proc = time.perf_counter()
@@ -332,8 +317,6 @@ def video_processing_thread():
                 frame = latest_packet[0].copy()
                 capture_ts = latest_packet[1]
         
-        # If no frame yet, or if we are processing the exact same frame timestamp as last time
-        # (Implementing a simple unique check to avoid reprocessing same frame)
         if frame is None: 
             time.sleep(0.001)
             continue
@@ -390,31 +373,11 @@ def video_processing_thread():
             for face_loc in last_face_locations:
                 body_id = get_containing_body_box(face_loc, body_boxes)
                 if body_id is not None:
-                    top, right, bottom, left = face_loc
+                    # Note: Enhancement logic removed as GFPGAN is disabled
+                    encoding_loc = [face_loc]
                     
-                    input_image_encoding = rgb_frame_for_encoding
-                    
-                    # GFPGAN Logic
-                    t_enhance = time.perf_counter()
-                    if GFPGAN_AVAILABLE and enhancement_mode == "on" and gfpgan_enhancer:
-                         t_pad = max(0, top - BOX_PADDING); b_pad = min(frame.shape[0], bottom + BOX_PADDING)
-                         l_pad = max(0, left - BOX_PADDING); r_pad = min(frame.shape[1], right + BOX_PADDING)
-                         face_crop_bgr = frame[t_pad:b_pad, l_pad:r_pad]
-                         try:
-                             _, _, restored_face = gfpgan_enhancer.enhance(
-                                 face_crop_bgr, has_aligned=False, only_center_face=True, paste_back=False
-                             )
-                             if restored_face is not None:
-                                 input_image_encoding = cv2.cvtColor(restored_face, cv2.COLOR_BGR2RGB)
-                                 encoding_loc = [(0, input_image_encoding.shape[1], input_image_encoding.shape[0], 0)]
-                             else: encoding_loc = [face_loc]
-                         except: encoding_loc = [face_loc]
-                    else:
-                        encoding_loc = [face_loc]
-                    timings['enhance'] = (time.perf_counter() - t_enhance) * 1000
-
                     # Recognition
-                    face_enc = face_recognition.face_encodings(input_image_encoding, encoding_loc)
+                    face_enc = face_recognition.face_encodings(rgb_frame_for_encoding, encoding_loc)
                     
                     name = "Unknown"; conf = 0.0
                     if face_enc and len(known_face_encodings) > 0:

@@ -2,3 +2,5 @@
 /gfpgan
 yolo11m.pt
 yolo11x.pt
+yolo11n.pt
+yolov11n-face.pt
